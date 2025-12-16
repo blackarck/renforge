@@ -18,15 +18,19 @@ jobs:
           - os: ubuntu-latest
             goos: linux
             arch: amd64
+            suffix: linux-amd64
           - os: windows-latest
             goos: windows
             arch: amd64
+            suffix: windows-amd64
           - os: macos-15-intel
             goos: darwin
             arch: amd64
+            suffix: macos-intel
           - os: macos-15
             goos: darwin
             arch: arm64
+            suffix: macos-silicon
 
     runs-on: ${{ matrix.os }}
 
@@ -110,7 +114,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          mv renforge.exe dist/renforge-windows-${{ matrix.arch }}.exe
+          mv renforge.exe dist/renforge-${{ matrix.suffix }}.exe
 
       - name: Create artifacts (Linux)
         if: matrix.goos == 'linux'
@@ -124,16 +128,16 @@ jobs:
           # Prefer a directory bundle if it exists, else fall back to a binary.
           if [ -d "renforge" ]; then
             echo "Found directory bundle: renforge/"
-            tar -czf dist/renforge-linux-${{ matrix.arch }}.tar.gz renforge
+            tar -czf dist/renforge-${{ matrix.suffix }}.tar.gz renforge
           elif [ -f "renforge" ]; then
             echo "Found binary: renforge"
-            tar -czf dist/renforge-linux-${{ matrix.arch }}.tar.gz renforge
+            tar -czf dist/renforge-${{ matrix.suffix }}.tar.gz renforge
           elif [ -f "renforge.tar.gz" ]; then
             echo "Found prebuilt tarball: renforge.tar.gz"
-            mv renforge.tar.gz dist/renforge-linux-${{ matrix.arch }}.tar.gz
+            mv renforge.tar.gz dist/renforge-${{ matrix.suffix }}.tar.gz
           elif [ -f "renforge.tar.xz" ]; then
             echo "Found prebuilt tarball: renforge.tar.xz"
-            mv renforge.tar.xz dist/renforge-linux-${{ matrix.arch }}.tar.xz
+            mv renforge.tar.xz dist/renforge-${{ matrix.suffix }}.tar.xz
           else
             echo "ERROR: Could not find Linux output from fyne package."
             echo "Contents:"
@@ -147,12 +151,12 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          ditto -c -k --sequesterRsrc --keepParent renforge.app dist/renforge-macos-${{ matrix.arch }}.zip
+          ditto -c -k --sequesterRsrc --keepParent renforge.app dist/renforge-${{ matrix.suffix }}.zip
 
       - name: Upload build artifacts (for release job)
         uses: actions/upload-artifact@v4
         with:
-          name: dist-${{ matrix.goos }}-${{ matrix.arch }}
+          name: dist-${{ matrix.suffix }}
           path: dist/*
 
   release:

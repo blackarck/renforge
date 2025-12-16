@@ -78,7 +78,7 @@ type RenamePlanItem struct {
 }
 
 func main() {
-	a := app.New()
+	a := app.NewWithID("com.blackarck.renforge")
 	w := a.NewWindow("File Rename Utility")
 	w.Resize(fyne.NewSize(1040, 680))
 
