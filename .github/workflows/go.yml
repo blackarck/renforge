@@ -21,10 +21,10 @@ jobs:
           - os: windows-latest
             goos: windows
             arch: amd64
-          - os: macos-13
+          - os: macos-15-intel
             goos: darwin
             arch: amd64
-          - os: macos-latest
+          - os: macos-15
             goos: darwin
             arch: arm64
 
