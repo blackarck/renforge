@@ -131,6 +131,9 @@ jobs:
           elif [ -f "renforge.tar.gz" ]; then
             echo "Found prebuilt tarball: renforge.tar.gz"
             mv renforge.tar.gz dist/renforge-linux-${{ matrix.arch }}.tar.gz
+          elif [ -f "renforge.tar.xz" ]; then
+            echo "Found prebuilt tarball: renforge.tar.xz"
+            mv renforge.tar.xz dist/renforge-linux-${{ matrix.arch }}.tar.xz
           else
             echo "ERROR: Could not find Linux output from fyne package."
             echo "Contents:"
