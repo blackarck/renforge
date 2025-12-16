@@ -1,0 +1,147 @@
+name: Release RenForge
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+          - os: windows-latest
+            goos: windows
+          - os: macos-latest
+            goos: darwin
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.1"
+
+      - name: Install fyne tool
+        run: go install fyne.io/fyne/v2/cmd/fyne@latest
+
+      # --- icon prep (Linux/macOS need png/icns) ---
+      - name: Install ImageMagick (Linux)
+        if: matrix.goos == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick
+
+      - name: Install ImageMagick (macOS)
+        if: matrix.goos == 'darwin'
+        run: |
+          brew update
+          brew install imagemagick
+
+      - name: Install ImageMagick (Windows)
+        if: matrix.goos == 'windows'
+        shell: pwsh
+        run: |
+          choco install imagemagick -y
+
+      - name: Create icon.png from icon.ico
+        if: matrix.goos != 'windows'
+        shell: bash
+        run: |
+          magick icon.ico icon.png
+
+      - name: Create icon.icns (macOS)
+        if: matrix.goos == 'darwin'
+        shell: bash
+        run: |
+          mkdir -p icon.iconset
+          sips -z 16 16     icon.png --out icon.iconset/icon_16x16.png
+          sips -z 32 32     icon.png --out icon.iconset/icon_16x16@2x.png
+          sips -z 32 32     icon.png --out icon.iconset/icon_32x32.png
+          sips -z 64 64     icon.png --out icon.iconset/icon_32x32@2x.png
+          sips -z 128 128   icon.png --out icon.iconset/icon_128x128.png
+          sips -z 256 256   icon.png --out icon.iconset/icon_128x128@2x.png
+          sips -z 256 256   icon.png --out icon.iconset/icon_256x256.png
+          sips -z 512 512   icon.png --out icon.iconset/icon_256x256@2x.png
+          sips -z 512 512   icon.png --out icon.iconset/icon_512x512.png
+          sips -z 1024 1024 icon.png --out icon.iconset/icon_512x512@2x.png
+          iconutil -c icns icon.iconset -o icon.icns
+
+      # --- package per OS (this embeds the icon correctly) ---
+      - name: Package (Windows)
+        if: matrix.goos == 'windows'
+        shell: bash
+        run: |
+          fyne package -os windows -name renforge -icon icon.ico
+
+      - name: Package (Linux)
+        if: matrix.goos == 'linux'
+        shell: bash
+        run: |
+          fyne package -os linux -name renforge -icon icon.png
+
+      - name: Package (macOS)
+        if: matrix.goos == 'darwin'
+        shell: bash
+        run: |
+          fyne package -os darwin -name renforge -icon icon.icns
+
+      # --- create release artifacts (single file per OS) ---
+      - name: Create artifacts (Windows)
+        if: matrix.goos == 'windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          mv renforge.exe dist/renforge-windows-amd64.exe
+
+      - name: Create artifacts (Linux)
+        if: matrix.goos == 'linux'
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -czf dist/renforge-linux-amd64.tar.gz renforge
+
+      - name: Create artifacts (macOS)
+        if: matrix.goos == 'darwin'
+        shell: bash
+        run: |
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent renforge.app dist/renforge-macos-universal.zip
+
+      - name: Upload build artifacts (for release job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten dist folder
+        shell: bash
+        run: |
+          mkdir -p out
+          find dist -type f -maxdepth 3 -exec mv {} out/ \;
+          ls -la out
+
+      - name: Create GitHub Release & upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
