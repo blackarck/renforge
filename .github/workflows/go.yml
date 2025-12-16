@@ -17,10 +17,16 @@ jobs:
         include:
           - os: ubuntu-latest
             goos: linux
+            arch: amd64
           - os: windows-latest
             goos: windows
+            arch: amd64
+          - os: macos-13
+            goos: darwin
+            arch: amd64
           - os: macos-latest
             goos: darwin
+            arch: arm64
 
     runs-on: ${{ matrix.os }}
 
@@ -30,7 +36,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25.x"
+          go-version: "1.23.x"
 
       - name: Install fyne tool (new)
         run: go install fyne.io/tools/cmd/fyne@latest
@@ -104,7 +110,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          mv renforge.exe dist/renforge-windows-amd64.exe
+          mv renforge.exe dist/renforge-windows-${{ matrix.arch }}.exe
 
       - name: Create artifacts (Linux)
         if: matrix.goos == 'linux'
@@ -118,13 +124,13 @@ jobs:
           # Prefer a directory bundle if it exists, else fall back to a binary.
           if [ -d "renforge" ]; then
             echo "Found directory bundle: renforge/"
-            tar -czf dist/renforge-linux-amd64.tar.gz renforge
+            tar -czf dist/renforge-linux-${{ matrix.arch }}.tar.gz renforge
           elif [ -f "renforge" ]; then
             echo "Found binary: renforge"
-            tar -czf dist/renforge-linux-amd64.tar.gz renforge
+            tar -czf dist/renforge-linux-${{ matrix.arch }}.tar.gz renforge
           elif [ -f "renforge.tar.gz" ]; then
             echo "Found prebuilt tarball: renforge.tar.gz"
-            mv renforge.tar.gz dist/renforge-linux-amd64.tar.gz
+            mv renforge.tar.gz dist/renforge-linux-${{ matrix.arch }}.tar.gz
           else
             echo "ERROR: Could not find Linux output from fyne package."
             echo "Contents:"
@@ -138,12 +144,12 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          ditto -c -k --sequesterRsrc --keepParent renforge.app dist/renforge-macos-universal.zip
+          ditto -c -k --sequesterRsrc --keepParent renforge.app dist/renforge-macos-${{ matrix.arch }}.zip
 
       - name: Upload build artifacts (for release job)
         uses: actions/upload-artifact@v4
         with:
-          name: dist-${{ matrix.goos }}
+          name: dist-${{ matrix.goos }}-${{ matrix.arch }}
           path: dist/*
 
   release:
