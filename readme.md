@@ -4,7 +4,7 @@ A lightweight desktop utility (built with **Go + Fyne**) to **filter files** and
 
 Website : https://renforgeapp.web.app
 Repo: https://github.com/blackarck/renforge
-
+Download : https://github.com/blackarck/RenForge/releases/tag/latest
 ---
 
 ## What it does (v1)
