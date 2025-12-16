@@ -35,6 +35,24 @@ jobs:
       - name: Install fyne tool (new)
         run: go install fyne.io/tools/cmd/fyne@latest
 
+      # ✅ Linux build deps required by glfw/go-gl (pkg-config, OpenGL, X11 headers, etc.)
+      - name: Install Linux GUI deps (Fyne)
+        if: matrix.goos == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libgl1-mesa-dev \
+            xorg-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxi-dev \
+            libxxf86vm-dev \
+            libasound2-dev
+
       # --- macOS: create icon.icns from icon.png (no ImageMagick needed) ---
       - name: Create icon.icns from icon.png (macOS)
         if: matrix.goos == 'darwin'
