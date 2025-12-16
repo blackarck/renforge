@@ -2,7 +2,7 @@
 
 A lightweight desktop utility (built with **Go + Fyne**) to **filter files** and **preview bulk renames** before applying them.
 
-Repo: https://github.com/BlakArckGames/FileRenUtil
+Repo: https://github.com/blackarck/renforge
 
 ---
 
@@ -88,7 +88,7 @@ The log includes:
 ## Install / Download
 
 - For the latest version, check the GitHub repo releases (if/when you add them):
-  https://github.com/BlakArckGames/FileRenUtil
+  https://github.com/blackarck/renforge
 
 ---
 

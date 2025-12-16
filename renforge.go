@@ -578,7 +578,7 @@ func main() {
 			"File Rename Utility helps you filter and preview files in a folder, then bulk-rename them safely.\n\n"+
 				"License: CC BY-NC 4.0 | Commercial \n\n"+
 				"Download the latest version here:\n"+
-				"https://github.com/BlakArckGames/FileRenUtil",
+				"https://github.com/blackarck/renforge",
 			w,
 		)
 	})
