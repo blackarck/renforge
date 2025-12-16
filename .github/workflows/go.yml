@@ -41,6 +41,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.23.x"
+          cache: false
 
       - name: Install fyne tool (new)
         run: go install fyne.io/tools/cmd/fyne@latest
