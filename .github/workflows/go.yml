@@ -111,7 +111,27 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          tar -czf dist/renforge-linux-amd64.tar.gz renforge
+
+          echo "Listing workspace after fyne package:"
+          ls -la
+
+          # Prefer a directory bundle if it exists, else fall back to a binary.
+          if [ -d "renforge" ]; then
+            echo "Found directory bundle: renforge/"
+            tar -czf dist/renforge-linux-amd64.tar.gz renforge
+          elif [ -f "renforge" ]; then
+            echo "Found binary: renforge"
+            tar -czf dist/renforge-linux-amd64.tar.gz renforge
+          elif [ -f "renforge.tar.gz" ]; then
+            echo "Found prebuilt tarball: renforge.tar.gz"
+            mv renforge.tar.gz dist/renforge-linux-amd64.tar.gz
+          else
+            echo "ERROR: Could not find Linux output from fyne package."
+            echo "Contents:"
+            ls -la
+            exit 1
+          fi
+
 
       - name: Create artifacts (macOS)
         if: matrix.goos == 'darwin'
