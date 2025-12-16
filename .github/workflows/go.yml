@@ -2,6 +2,9 @@ name: Release RenForge
 
 on:
   push:
+    branches:
+      - main
+      - master
     tags:
       - "v*"
   workflow_dispatch:
@@ -108,7 +111,7 @@ jobs:
         run: |
           test -f icon.icns
           # Explicitly pass arch to ensure correct build
-          fyne package -os darwin -arch ${{ matrix.arch }} -name renforge -icon icon.icns
+          fyne package -os darwin -name renforge -icon icon.icns
 
           # Ad-hoc codesign is required for Apple Silicon
           # Fyne usually does this, but we force it here to be safe and ensure deep signing
