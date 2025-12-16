@@ -30,62 +30,57 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.25.1"
+          go-version: "1.25.x"
 
-      - name: Install fyne tool
-        run: go install fyne.io/fyne/v2/cmd/fyne@latest
+      - name: Install fyne tool (new)
+        run: go install fyne.io/tools/cmd/fyne@latest
 
-      # --- icon prep (Linux/macOS need png/icns) ---
-      - name: Install ImageMagick (Linux)
-        if: matrix.goos == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y imagemagick
-
-      - name: Install ImageMagick (macOS)
-        if: matrix.goos == 'darwin'
-        run: |
-          brew update
-          brew install imagemagick
-
-      - name: Install ImageMagick (Windows)
-        if: matrix.goos == 'windows'
-        shell: pwsh
-        run: |
-          choco install imagemagick -y
-
-      - name: Create icon.png from icon.ico (Linux)
-        if: matrix.goos == 'linux'
-        shell: bash
-        run: |
-          convert icon.ico icon.png
-
-      - name: Create icon.png from icon.ico (macOS)
+      # --- macOS: create icon.icns from icon.png (no ImageMagick needed) ---
+      - name: Create icon.icns from icon.png (macOS)
         if: matrix.goos == 'darwin'
         shell: bash
         run: |
-          magick icon.ico icon.png
+          test -f icon.png
 
-      # --- package per OS (this embeds the icon correctly) ---
+          mkdir -p icon.iconset
+          sips -z 16 16     icon.png --out icon.iconset/icon_16x16.png
+          sips -z 32 32     icon.png --out icon.iconset/icon_16x16@2x.png
+          sips -z 32 32     icon.png --out icon.iconset/icon_32x32.png
+          sips -z 64 64     icon.png --out icon.iconset/icon_32x32@2x.png
+          sips -z 128 128   icon.png --out icon.iconset/icon_128x128.png
+          sips -z 256 256   icon.png --out icon.iconset/icon_128x128@2x.png
+          sips -z 256 256   icon.png --out icon.iconset/icon_256x256.png
+          sips -z 512 512   icon.png --out icon.iconset/icon_256x256@2x.png
+          sips -z 512 512   icon.png --out icon.iconset/icon_512x512.png
+          sips -z 1024 1024 icon.png --out icon.iconset/icon_512x512@2x.png
+
+          iconutil -c icns icon.iconset -o icon.icns
+          test -f icon.icns
+          ls -la icon.icns
+
+      # --- Package per OS ---
       - name: Package (Windows)
         if: matrix.goos == 'windows'
         shell: bash
         run: |
+          test -f icon.ico
           fyne package -os windows -name renforge -icon icon.ico
 
       - name: Package (Linux)
         if: matrix.goos == 'linux'
         shell: bash
         run: |
+          test -f icon.png
           fyne package -os linux -name renforge -icon icon.png
 
       - name: Package (macOS)
         if: matrix.goos == 'darwin'
         shell: bash
         run: |
+          test -f icon.icns
           fyne package -os darwin -name renforge -icon icon.icns
 
-      # --- create release artifacts (single file per OS) ---
+      # --- Create single-file artifacts per OS ---
       - name: Create artifacts (Windows)
         if: matrix.goos == 'windows'
         shell: bash
