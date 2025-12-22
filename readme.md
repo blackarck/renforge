@@ -2,9 +2,10 @@
 
 A lightweight desktop utility (built with **Go + Fyne**) to **filter files** and **preview bulk renames** before applying them.
 
-Website : https://renforgeapp.web.app
-Repo: https://github.com/blackarck/renforge
-Download : https://github.com/blackarck/RenForge/releases/tag/latest
+- Website : https://renforgeapp.web.app
+- Repo: https://github.com/blackarck/renforge
+- Download : https://github.com/blackarck/RenForge/releases/tag/latest
+- [![RenForge Demo](https://img.youtube.com/vi/x36PhFQ_yCY/0.jpg)](https://youtu.be/x36PhFQ_yCY)
 ---
 
 ## What it does (v1)
