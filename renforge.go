@@ -49,6 +49,7 @@ type RenameStep struct {
 
 type AppState struct {
 	folderPath string
+	recursive  bool
 
 	allFiles      []string
 	filteredFiles []string
@@ -65,7 +66,10 @@ type AppState struct {
 	steps      []RenameStep
 	nextStepID int
 
-	previewCounts map[string]int // previewName -> count in filteredFiles
+	// key: "dir\x00previewName" -> count among selected files in that dir
+	previewCounts map[string]int
+	// paths the user has explicitly excluded from the apply operation
+	deselected map[string]bool
 }
 
 type RenamePlanItem struct {
@@ -77,6 +81,11 @@ type RenamePlanItem struct {
 	Reason  string
 }
 
+const (
+	recentFoldersKey = "recent_folders"
+	maxRecentFolders = 5
+)
+
 func main() {
 	a := app.NewWithID("com.blackarck.renforge")
 	w := a.NewWindow("File Rename Utility")
@@ -86,6 +95,40 @@ func main() {
 		pageSize:      10,
 		matchAll:      true,
 		previewCounts: map[string]int{},
+		deselected:    map[string]bool{},
+	}
+
+	/* -------------------- Recent Folders -------------------- */
+
+	getRecentFolders := func() []string {
+		raw := a.Preferences().String(recentFoldersKey)
+		if raw == "" {
+			return nil
+		}
+		return strings.Split(raw, "|")
+	}
+
+	// forward declaration so saveRecentFolder can reference it after creation
+	var recentSelect *widget.Select
+
+	saveRecentFolder := func(path string) {
+		recents := getRecentFolders()
+		next := recents[:0]
+		for _, r := range recents {
+			if r != path {
+				next = append(next, r)
+			}
+		}
+		next = append([]string{path}, next...)
+		if len(next) > maxRecentFolders {
+			next = next[:maxRecentFolders]
+		}
+		a.Preferences().SetString(recentFoldersKey, strings.Join(next, "|"))
+		if recentSelect != nil {
+			opts := append([]string{"Open recent…"}, next...)
+			recentSelect.SetOptions(opts)
+			recentSelect.SetSelected("Open recent…")
+		}
 	}
 
 	/* -------------------- Right: Preview -------------------- */
@@ -106,34 +149,62 @@ func main() {
 		return rt
 	}
 
+	selCount := func() int {
+		n := 0
+		for _, p := range state.filteredFiles {
+			if !state.deselected[p] {
+				n++
+			}
+		}
+		return n
+	}
+
+	// forward declaration: renderPreview and updatePageView reference each other
+	var updatePageView func()
+
 	renderPreview := func() {
 		previewBox.Objects = nil
 
+		h0 := widget.NewLabelWithStyle("✓", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
 		h1 := widget.NewLabelWithStyle("Original (full file name)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 		h2 := widget.NewLabelWithStyle("Preview (after rename steps)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-		previewBox.Add(container.NewGridWithColumns(2, h1, h2))
+		previewBox.Add(container.NewGridWithColumns(3, h0, h1, h2))
 		previewBox.Add(widget.NewSeparator())
 
 		for _, full := range state.viewFiles {
+			full := full // per-iteration variable for closure
 			origName := filepath.Base(full)
 			prevName := applyRenameSteps(origName, state.steps)
 
 			warn := ""
 			if reason := invalidNameReason(prevName); reason != "" {
 				warn = "  ⚠ " + reason
-			} else if state.previewCounts[prevName] > 1 && prevName != origName {
-				warn = "  ⚠ conflict"
-			} else {
-				// also show warning if target exists on disk (for this single file)
-				target := filepath.Join(filepath.Dir(full), prevName)
-				if prevName != origName {
+			} else if !state.deselected[full] {
+				// only show conflict warning for selected files
+				dirKey := filepath.Dir(full) + "\x00" + prevName
+				if state.previewCounts[dirKey] > 1 && prevName != origName {
+					warn = "  ⚠ conflict"
+				} else if prevName != origName {
+					target := filepath.Join(filepath.Dir(full), prevName)
 					if _, err := os.Stat(target); err == nil {
 						warn = "  ⚠ target exists"
 					}
 				}
 			}
 
-			previewBox.Add(container.NewGridWithColumns(2,
+			chk := widget.NewCheck("", func(checked bool) {
+				if checked {
+					delete(state.deselected, full)
+				} else {
+					state.deselected[full] = true
+				}
+				recomputePreviewCounts(state)
+				updatePageView()
+			})
+			chk.Checked = !state.deselected[full] // direct field set; SetChecked would trigger OnChanged → infinite loop
+
+			previewBox.Add(container.NewGridWithColumns(3,
+				chk,
 				makeCell(origName),
 				makeCell(prevName+warn),
 			))
@@ -149,7 +220,7 @@ func main() {
 	pageLabel := widget.NewLabel("Page 1/1")
 	pageLabel.Alignment = fyne.TextAlignCenter
 
-	updatePageView := func() {
+	updatePageView = func() {
 		totalMatches := len(state.filteredFiles)
 		totalFiles := len(state.allFiles)
 
@@ -167,10 +238,14 @@ func main() {
 
 		state.viewFiles = state.filteredFiles[start:end]
 
+		sel := selCount()
 		if totalMatches == 0 {
 			resultsHeader.SetText(fmt.Sprintf("No matches (0 of %d files).", totalFiles))
 		} else {
-			resultsHeader.SetText(fmt.Sprintf("Showing %d–%d of %d matches (%d total files).", start+1, end, totalMatches, totalFiles))
+			resultsHeader.SetText(fmt.Sprintf(
+				"Showing %d–%d of %d matches · %d selected · %d total files.",
+				start+1, end, totalMatches, sel, totalFiles,
+			))
 		}
 
 		pageLabel.SetText(fmt.Sprintf("Page %d/%d", state.page+1, pages))
@@ -190,14 +265,34 @@ func main() {
 	prevBtn.OnTapped = func() { state.page--; updatePageView() }
 	nextBtn.OnTapped = func() { state.page++; updatePageView() }
 
+	/* -------------------- Select All / Deselect All -------------------- */
+
+	selectAllBtn := widget.NewButton("Select All", func() {
+		state.deselected = map[string]bool{}
+		recomputePreviewCounts(state)
+		updatePageView()
+	})
+
+	deselectAllBtn := widget.NewButton("Deselect All", func() {
+		for _, p := range state.filteredFiles {
+			state.deselected[p] = true
+		}
+		recomputePreviewCounts(state)
+		updatePageView()
+	})
+
 	rightTop := container.NewVBox(
-		container.NewBorder(nil, nil, nil, container.NewHBox(prevBtn, pageLabel, nextBtn), resultsHeader),
+		container.NewBorder(nil, nil, nil,
+			container.NewHBox(prevBtn, pageLabel, nextBtn),
+			resultsHeader,
+		),
+		container.NewHBox(selectAllBtn, deselectAllBtn),
 		widget.NewSeparator(),
 	)
 
 	/* -------------------- Bottom Actions (Dry Run / Apply / Undo CSV) -------------------- */
 
-	dryRunCheck := widget.NewCheck("Dry run (don’t rename)", nil)
+	dryRunCheck := widget.NewCheck("Dry run (don't rename)", nil)
 	dryRunCheck.SetChecked(true)
 
 	undoLogCheck := widget.NewCheck("Create undo log (CSV)", nil)
@@ -208,13 +303,14 @@ func main() {
 			dialog.ShowInformation("Nothing to do", "Select a folder and ensure you have matching files.", w)
 			return
 		}
+		if selCount() == 0 {
+			dialog.ShowInformation("Nothing selected", "No files are selected for rename. Use the checkboxes or Select All.", w)
+			return
+		}
 
 		plan, summary := buildPlan(state)
-
-		// Build a confirmation message with issues
 		msg := buildConfirmMessage(summary)
 
-		// If user wants undo log, we’ll ask where to save it (even for Dry run)
 		doWithOptionalCSV := func(onSaved func(savePath string)) {
 			if !undoLogCheck.Checked {
 				onSaved("")
@@ -223,13 +319,10 @@ func main() {
 			saveName := fmt.Sprintf("undo_log_%s.csv", time.Now().Format("20060102_150405"))
 			d := dialog.NewFileSave(func(uc fyne.URIWriteCloser, err error) {
 				if err != nil || uc == nil {
-					// user cancelled save; continue without log
 					onSaved("")
 					return
 				}
 				defer uc.Close()
-
-				// write CSV (initially as plan with statuses "ok/skip" before execution)
 				if err := writeUndoCSV(uc, plan); err != nil {
 					dialog.ShowError(err, w)
 					onSaved("")
@@ -250,7 +343,6 @@ func main() {
 
 				doWithOptionalCSV(func(savedCSV string) {
 					if dryRunCheck.Checked {
-						// Mark plan as dry-run and show summary
 						for i := range plan {
 							if plan[i].Status == "ok" {
 								plan[i].Status = "dry-run"
@@ -264,11 +356,8 @@ func main() {
 						return
 					}
 
-					// Apply renames (only items Status == "ok")
 					applyResults := applyRenames(plan)
 
-					// If they asked for CSV and saved earlier, rewrite it with final statuses.
-					// (If they cancelled save, savedCSV == "")
 					if savedCSV != "" {
 						_ = overwriteUndoCSV(savedCSV, applyResults)
 					}
@@ -279,8 +368,7 @@ func main() {
 						prettyPath(savedCSV),
 					), w)
 
-					// Refresh folder view after renaming
-					files, err := listAllFiles(state.folderPath)
+					files, err := listAllFiles(state.folderPath, state.recursive)
 					if err == nil {
 						state.allFiles = files
 						applyAll(state)
@@ -433,7 +521,6 @@ func main() {
 			b := widget.NewEntry()
 			b.SetText(step.B)
 
-			// placeholders
 			a.SetPlaceHolder("A")
 			b.SetPlaceHolder("B (Replace only)")
 			b.Enable()
@@ -538,11 +625,28 @@ func main() {
 	selectedFolderLabel := widget.NewLabel("Folder: (none)")
 	selectedFolderLabel.Truncation = fyne.TextTruncateEllipsis
 
+	// Recursive toggle — reloads current folder when toggled
+	recursiveCheck := widget.NewCheck("Include subfolders", func(v bool) {
+		state.recursive = v
+		if state.folderPath == "" {
+			return
+		}
+		files, err := listAllFiles(state.folderPath, state.recursive)
+		if err != nil {
+			dialog.ShowError(err, w)
+			return
+		}
+		state.allFiles = files
+		state.deselected = map[string]bool{}
+		applyAll(state)
+		updatePageView()
+	})
+
 	loadFolder := func(path string) {
 		state.folderPath = path
-		selectedFolderLabel.SetText("Folder: " + state.folderPath)
+		selectedFolderLabel.SetText("Folder: " + path)
 
-		files, err := listAllFiles(state.folderPath)
+		files, err := listAllFiles(path, state.recursive)
 		if err != nil {
 			dialog.ShowError(err, w)
 			state.allFiles = nil
@@ -552,9 +656,22 @@ func main() {
 		}
 
 		state.allFiles = files
+		state.deselected = map[string]bool{}
 		applyAll(state)
 		updatePageView()
+		saveRecentFolder(path)
 	}
+
+	// Recent folders dropdown — populated from persisted preferences
+	initialRecents := getRecentFolders()
+	recentOpts := append([]string{"Open recent…"}, initialRecents...)
+	recentSelect = widget.NewSelect(recentOpts, func(sel string) {
+		if sel == "Open recent…" {
+			return
+		}
+		loadFolder(sel)
+	})
+	recentSelect.SetSelected("Open recent…")
 
 	refreshBtn := widget.NewButton("Refresh", func() {
 		if state.folderPath == "" {
@@ -584,7 +701,7 @@ func main() {
 	})
 
 	topBar := container.NewBorder(nil, nil,
-		container.NewHBox(selectFolderBtn, refreshBtn),
+		container.NewHBox(selectFolderBtn, recentSelect, refreshBtn, recursiveCheck),
 		container.NewHBox(aboutBtn),
 		selectedFolderLabel,
 	)
@@ -597,7 +714,6 @@ func main() {
 	root := container.NewBorder(topBar, nil, nil, nil, split)
 	w.SetContent(root)
 
-	// empty initial
 	updatePageView()
 
 	w.ShowAndRun()
@@ -622,9 +738,13 @@ func applyFilters(state *AppState) {
 func recomputePreviewCounts(state *AppState) {
 	counts := make(map[string]int, len(state.filteredFiles))
 	for _, p := range state.filteredFiles {
+		if state.deselected[p] {
+			continue
+		}
 		orig := filepath.Base(p)
 		prev := applyRenameSteps(orig, state.steps)
-		counts[prev]++
+		// key by (dir, previewName) so files in different subdirs don't false-conflict
+		counts[filepath.Dir(p)+"\x00"+prev]++
 	}
 	state.previewCounts = counts
 }
@@ -641,25 +761,32 @@ type PlanSummary struct {
 }
 
 func buildPlan(state *AppState) ([]RenamePlanItem, PlanSummary) {
-	items := make([]RenamePlanItem, 0, len(state.filteredFiles))
-
-	// preview duplicates in selected set
-	dupCount := map[string]int{}
-	previewByOld := map[string]string{}
-
+	// operate only on selected (non-deselected) files
+	var selected []string
 	for _, p := range state.filteredFiles {
-		oldName := filepath.Base(p)
-		newName := applyRenameSteps(oldName, state.steps)
-		previewByOld[oldName] = newName
-		dupCount[newName]++
+		if !state.deselected[p] {
+			selected = append(selected, p)
+		}
+	}
+
+	items := make([]RenamePlanItem, 0, len(selected))
+
+	// key: "dir\x00newName" -> count, to detect within-dir conflicts
+	dupCount := map[string]int{}
+	previewByPath := map[string]string{}
+
+	for _, p := range selected {
+		newName := applyRenameSteps(filepath.Base(p), state.steps)
+		previewByPath[p] = newName
+		dupCount[filepath.Dir(p)+"\x00"+newName]++
 	}
 
 	var sum PlanSummary
-	sum.Total = len(state.filteredFiles)
+	sum.Total = len(selected)
 
-	for _, oldPath := range state.filteredFiles {
+	for _, oldPath := range selected {
 		oldName := filepath.Base(oldPath)
-		newName := previewByOld[oldName]
+		newName := previewByPath[oldPath]
 		newPath := filepath.Join(filepath.Dir(oldPath), newName)
 
 		it := RenamePlanItem{
@@ -670,17 +797,14 @@ func buildPlan(state *AppState) ([]RenamePlanItem, PlanSummary) {
 			Status:  "ok",
 		}
 
-		// unchanged
 		if newName == oldName {
 			sum.Unchanged++
-			// unchanged is OK to keep (but no need to rename)
 			it.Status = "skip"
 			it.Reason = "unchanged"
 			items = append(items, it)
 			continue
 		}
 
-		// invalid name
 		if reason := invalidNameReason(newName); reason != "" {
 			sum.Invalid = append(sum.Invalid, fmt.Sprintf("%s → %s (%s)", oldName, newName, reason))
 			it.Status = "skip"
@@ -689,8 +813,7 @@ func buildPlan(state *AppState) ([]RenamePlanItem, PlanSummary) {
 			continue
 		}
 
-		// duplicate preview name within selection
-		if dupCount[newName] > 1 {
+		if dupCount[filepath.Dir(oldPath)+"\x00"+newName] > 1 {
 			sum.Duplicate = append(sum.Duplicate, fmt.Sprintf("%s → %s", oldName, newName))
 			it.Status = "skip"
 			it.Reason = "conflict: duplicate preview name"
@@ -698,7 +821,6 @@ func buildPlan(state *AppState) ([]RenamePlanItem, PlanSummary) {
 			continue
 		}
 
-		// target exists on disk (simple safety)
 		if _, err := os.Stat(newPath); err == nil {
 			sum.TargetExists = append(sum.TargetExists, fmt.Sprintf("%s → %s", oldName, newName))
 			it.Status = "skip"
@@ -722,8 +844,7 @@ func buildConfirmMessage(sum PlanSummary) string {
 
 	if len(sum.Invalid) > 0 {
 		b.WriteString("Invalid names (skipped):\n")
-		for i, s := range firstN(sum.Invalid, 20) {
-			_ = i
+		for _, s := range firstN(sum.Invalid, 20) {
 			b.WriteString(" - " + s + "\n")
 		}
 		if len(sum.Invalid) > 20 {
@@ -758,26 +879,45 @@ func buildConfirmMessage(sum PlanSummary) string {
 	return b.String()
 }
 
+// applyRenames uses a two-phase rename to safely handle circular renames
+// (e.g. a→b and b→a). Phase 1 moves every file to a temp name; phase 2
+// moves each temp name to its final destination.
 func applyRenames(plan []RenamePlanItem) []RenamePlanItem {
-	out := make([]RenamePlanItem, 0, len(plan))
+	out := make([]RenamePlanItem, len(plan))
+	copy(out, plan)
 
-	for _, it := range plan {
-		// skip unchanged/invalid/conflicts
-		if it.Status != "ok" {
-			out = append(out, it)
+	type staged struct {
+		idx     int
+		tmpPath string
+	}
+	var phase2 []staged
+
+	ts := time.Now().UnixNano()
+
+	for i := range out {
+		if out[i].Status != "ok" {
 			continue
 		}
-
-		err := os.Rename(it.OldPath, it.NewPath)
-		if err != nil {
-			it.Status = "error"
-			it.Reason = err.Error()
-		} else {
-			it.Status = "renamed"
-			it.Reason = ""
+		tmpPath := filepath.Join(filepath.Dir(out[i].OldPath), fmt.Sprintf(".renforge_tmp_%d_%d", ts, i))
+		if err := os.Rename(out[i].OldPath, tmpPath); err != nil {
+			out[i].Status = "error"
+			out[i].Reason = err.Error()
+			continue
 		}
-		out = append(out, it)
+		phase2 = append(phase2, staged{i, tmpPath})
 	}
+
+	for _, s := range phase2 {
+		if err := os.Rename(s.tmpPath, out[s.idx].NewPath); err != nil {
+			out[s.idx].Status = "error"
+			out[s.idx].Reason = err.Error()
+			// best-effort restore to original name
+			_ = os.Rename(s.tmpPath, out[s.idx].OldPath)
+		} else {
+			out[s.idx].Status = "renamed"
+		}
+	}
+
 	return out
 }
 
@@ -807,7 +947,6 @@ func buildResultMessage(items []RenamePlanItem, dryRun bool) string {
 func writeUndoCSV(wc fyne.URIWriteCloser, plan []RenamePlanItem) error {
 	cw := csv.NewWriter(wc)
 	defer cw.Flush()
-
 	_ = cw.Write([]string{"old_path", "new_path", "old_name", "new_name", "status", "reason"})
 	for _, it := range plan {
 		_ = cw.Write([]string{it.OldPath, it.NewPath, it.OldName, it.NewName, it.Status, it.Reason})
@@ -824,7 +963,6 @@ func overwriteUndoCSV(path string, plan []RenamePlanItem) error {
 
 	cw := csv.NewWriter(f)
 	defer cw.Flush()
-
 	_ = cw.Write([]string{"old_path", "new_path", "old_name", "new_name", "status", "reason"})
 	for _, it := range plan {
 		_ = cw.Write([]string{it.OldPath, it.NewPath, it.OldName, it.NewName, it.Status, it.Reason})
@@ -834,22 +972,44 @@ func overwriteUndoCSV(path string, plan []RenamePlanItem) error {
 
 /* -------------------- File listing -------------------- */
 
-func listAllFiles(folder string) ([]string, error) {
-	entries, err := os.ReadDir(folder)
-	if err != nil {
-		return nil, err
-	}
+func listAllFiles(folder string, recursive bool) ([]string, error) {
 	var files []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
+
+	if recursive {
+		err := filepath.WalkDir(folder, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			name := strings.TrimSpace(d.Name())
+			if name == "" {
+				return nil
+			}
+			files = append(files, path)
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
-		name := strings.TrimSpace(e.Name())
-		if name == "" {
-			continue
+	} else {
+		entries, err := os.ReadDir(folder)
+		if err != nil {
+			return nil, err
 		}
-		files = append(files, filepath.Join(folder, name))
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := strings.TrimSpace(e.Name())
+			if name == "" {
+				continue
+			}
+			files = append(files, filepath.Join(folder, name))
+		}
 	}
+
 	sort.Strings(files)
 	return files, nil
 }
@@ -984,8 +1144,10 @@ func invalidNameReason(name string) string {
 	}
 	reserved := map[string]bool{
 		"CON": true, "PRN": true, "AUX": true, "NUL": true,
-		"COM1": true, "COM2": true, "COM3": true, "COM4": true, "COM5": true, "COM6": true, "COM7": true, "COM8": true, "COM9": true,
-		"LPT1": true, "LPT2": true, "LPT3": true, "LPT4": true, "LPT5": true, "LPT6": true, "LPT7": true, "LPT8": true, "LPT9": true,
+		"COM1": true, "COM2": true, "COM3": true, "COM4": true, "COM5": true,
+		"COM6": true, "COM7": true, "COM8": true, "COM9": true,
+		"LPT1": true, "LPT2": true, "LPT3": true, "LPT4": true, "LPT5": true,
+		"LPT6": true, "LPT7": true, "LPT8": true, "LPT9": true,
 	}
 	base := strings.TrimSuffix(trim, filepath.Ext(trim))
 	if reserved[strings.ToUpper(base)] {
