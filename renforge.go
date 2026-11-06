@@ -1,49 +1,30 @@
 package main
 
 import (
-	"encoding/csv"
+	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+
+	"FileRenUtil/internal/filter"
+	"FileRenUtil/internal/meta"
+	"FileRenUtil/internal/preset"
+	"FileRenUtil/internal/rename"
+	"FileRenUtil/internal/undo"
 )
-
-/* -------------------- Filters -------------------- */
-
-type FilterRule struct {
-	ID    int
-	Mode  string // "contains", "starts with", "ends with", "extension"
-	Value string
-}
-
-/* -------------------- Rename Steps -------------------- */
-
-type RenameOp string
-
-const (
-	OpRemoveText      RenameOp = "Remove text"
-	OpReplaceText     RenameOp = "Replace text"
-	OpInsertBeforeExt RenameOp = "Insert before extension"
-	OpChangeExt       RenameOp = "Change extension"
-	OpAppend          RenameOp = "Append"
-	OpPrepend         RenameOp = "Prepend"
-)
-
-type RenameStep struct {
-	ID int
-	Op RenameOp
-	A  string
-	B  string
-}
 
 /* -------------------- App State -------------------- */
 
@@ -53,49 +34,192 @@ type AppState struct {
 
 	allFiles      []string
 	filteredFiles []string
-	viewFiles     []string
 
-	page     int
-	pageSize int
-
-	filters       []FilterRule
+	filters       []filter.Rule
 	nextFilterID  int
 	matchAll      bool
 	caseSensitive bool
 
-	steps      []RenameStep
+	steps      []rename.Step
 	nextStepID int
 
-	// key: "dir\x00previewName" -> count among selected files in that dir
+	// new name of every *selected* file (numbering depends on the selection)
+	previewNames map[string]string
+	// key: rename.DupKey(dir, previewName) -> count among selected files
 	previewCounts map[string]int
 	// paths the user has explicitly excluded from the apply operation
 	deselected map[string]bool
+
+	// order of the file list (and therefore of numbering)
+	sortMode string
+
+	// width of the preview list, used to estimate how many lines names wrap to
+	listWidth float32
+
+	// which rows the preview shows (All / Changed / Problems) and the counts
+	viewMode    string
+	problemKind rowKind // narrows the Problems view to one kind (rowNone = all problems)
+	visible     []string
+	nChanged    int
+	nProblems   int
+	kindCounts  [rowTaken + 1]int
+	pathIndex   map[string]string // PathKey -> path of every scanned file
+
+	// share of the preview width given to the "Original" column (draggable)
+	colRatio float32
+
+	// related files (sidecars) renamed together with their primary file
+	sidecars    bool
+	sidecarExts string
+	sidecarSet  map[string]bool
+	sidecarIx   *rename.SidecarIndex
+
+	// background folder scan and metadata loading
+	scanID     int
+	scanning   bool
+	cancelScan context.CancelFunc
+	metaID     int
+	cancelMeta context.CancelFunc
 }
 
-type RenamePlanItem struct {
-	OldPath string
-	NewPath string
-	OldName string
-	NewName string
-	Status  string // "ok" | "skip" | "renamed" | "error" | "dry-run"
-	Reason  string
+// Sort modes of the file list.
+const (
+	sortNameAsc  = "Name A–Z"
+	sortNameDesc = "Name Z–A"
+	sortDateAsc  = "Oldest first"
+	sortDateDesc = "Newest first"
+	sortSizeAsc  = "Smallest first"
+	sortSizeDesc = "Largest first"
+)
+
+var sortModes = []string{sortNameAsc, sortNameDesc, sortDateAsc, sortDateDesc, sortSizeAsc, sortSizeDesc}
+
+// sortNeed is the metadata a sort mode needs.
+func sortNeed(mode string) meta.Level {
+	switch mode {
+	case sortDateAsc, sortDateDesc:
+		return meta.EXIF // capture date, falling back to modification time
+	case sortSizeAsc, sortSizeDesc:
+		return meta.Stat
+	}
+	return meta.None
+}
+
+func maxLevel(a, b meta.Level) meta.Level {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// neededMeta is the metadata level the current steps and sort order require.
+func (s *AppState) neededMeta() meta.Level {
+	return maxLevel(rename.MetaNeeds(s.steps), sortNeed(s.sortMode))
+}
+
+func (s *AppState) selected() []string {
+	sel := make([]string, 0, len(s.filteredFiles))
+	for _, p := range s.filteredFiles {
+		if !s.deselected[p] {
+			sel = append(sel, p)
+		}
+	}
+	return sel
+}
+
+func (s *AppState) hasActiveSteps() bool {
+	for _, st := range s.steps {
+		if !st.Disabled {
+			return true
+		}
+	}
+	return false
 }
 
 const (
-	recentFoldersKey = "recent_folders"
-	maxRecentFolders = 5
+	recentFoldersKey  = "recent_folders"
+	maxRecentFolders  = 5
+	lastUndoLogKey    = "last_undo_log"
+	seenHelpKey       = "seen_help"
+	textScaleKey      = "text_scale_idx"
+	sidecarsKey       = "sidecars"
+	sidecarExtsKey    = "sidecar_exts"
+	themeModeKey      = "theme_mode"
+	colRatioKey       = "col_ratio"
+	winWKey           = "win_w"
+	winHKey           = "win_h"
+	splitKey          = "split_offset"
+	recentPlaceholder = "Recent…"
 )
 
 func main() {
 	a := app.NewWithID("com.blackarck.renforge")
-	w := a.NewWindow("File Rename Utility")
-	w.Resize(fyne.NewSize(1040, 680))
+	w := a.NewWindow("RenForge — File Rename Utility")
+	buildUI(a, w)
+	w.ShowAndRun()
+}
+
+// appUI exposes a few handles to the running window (used by the screenshot
+// generator in screenshots_test.go).
+type appUI struct {
+	state       *AppState
+	loadFolder  func(path string)
+	loadPreset  func(preset.Preset)
+	refreshView func()
+	applyBtn    *widget.Button
+	collapse    func(stepIndex int) // collapse one rename step to a single line
+}
+
+// buildUI creates all widgets and puts them into w.
+func buildUI(a fyne.App, w fyne.Window) *appUI {
+	a.SetIcon(appIcon)
+	textScaleIdx := a.Preferences().IntWithFallback(textScaleKey, defaultTextScaleIdx)
+	if textScaleIdx < 0 || textScaleIdx >= len(textScales) {
+		textScaleIdx = defaultTextScaleIdx
+	}
+	themeMode := a.Preferences().IntWithFallback(themeModeKey, modeAuto)
+	if themeMode < 0 || themeMode >= len(modeNames) {
+		themeMode = modeAuto
+	}
+	a.Settings().SetTheme(newScaledTheme(textScales[textScaleIdx], themeMode))
+	if ww, hh := a.Preferences().FloatWithFallback(winWKey, 0), a.Preferences().FloatWithFallback(winHKey, 0); ww >= 700 && hh >= 450 && ww < 6000 && hh < 4000 {
+		w.Resize(fyne.NewSize(float32(ww), float32(hh)))
+	} else {
+		w.Resize(fyne.NewSize(1100, 700))
+	}
+	colRatio := float32(a.Preferences().FloatWithFallback(colRatioKey, 0.5))
+	if colRatio < 0.2 || colRatio > 0.8 {
+		colRatio = 0.5
+	}
 
 	state := &AppState{
-		pageSize:      10,
 		matchAll:      true,
+		sortMode:      sortNameAsc,
+		viewMode:      viewAll,
+		colRatio:      colRatio,
+		sidecars:      a.Preferences().Bool(sidecarsKey),
+		sidecarExts:   a.Preferences().StringWithFallback(sidecarExtsKey, rename.DefaultSidecarExts),
+		sidecarSet:    rename.ParseExts(a.Preferences().StringWithFallback(sidecarExtsKey, rename.DefaultSidecarExts)),
+		previewNames:  map[string]string{},
 		previewCounts: map[string]int{},
 		deselected:    map[string]bool{},
+	}
+
+	/* -------------------- Background helper -------------------- */
+
+	// runBusy shows a modal "working" dialog, runs work off the UI thread,
+	// then calls done back on the UI thread.
+	runBusy := func(title string, work func(), done func()) {
+		d := dialog.NewCustomWithoutButtons(title, widget.NewProgressBarInfinite(), w)
+		d.Resize(fyne.NewSize(320, 100))
+		d.Show()
+		go func() {
+			work()
+			fyne.Do(func() {
+				d.Hide()
+				done()
+			})
+		}()
 	}
 
 	/* -------------------- Recent Folders -------------------- */
@@ -112,185 +236,407 @@ func main() {
 	var recentSelect *widget.Select
 
 	saveRecentFolder := func(path string) {
-		recents := getRecentFolders()
-		next := recents[:0]
-		for _, r := range recents {
+		next := []string{path}
+		for _, r := range getRecentFolders() {
 			if r != path {
 				next = append(next, r)
 			}
 		}
-		next = append([]string{path}, next...)
 		if len(next) > maxRecentFolders {
 			next = next[:maxRecentFolders]
 		}
 		a.Preferences().SetString(recentFoldersKey, strings.Join(next, "|"))
 		if recentSelect != nil {
-			opts := append([]string{"Open recent…"}, next...)
-			recentSelect.SetOptions(opts)
-			recentSelect.SetSelected("Open recent…")
+			recentSelect.SetOptions(append([]string{recentPlaceholder}, next...))
+			recentSelect.SetSelected(recentPlaceholder)
 		}
 	}
 
-	/* -------------------- Right: Preview -------------------- */
+	/* -------------------- Right: Preview (virtualized list) -------------------- */
 
 	resultsHeader := widget.NewLabel("No folder selected.")
 	resultsHeader.TextStyle = fyne.TextStyle{Bold: true}
 
-	previewBox := container.NewVBox()
+	scanBar := widget.NewProgressBarInfinite()
+	scanLabel := widget.NewLabel("")
+	scanRow := container.NewBorder(nil, nil, nil, scanLabel, scanBar)
+	scanRow.Hide()
 
-	makeCell := func(text string) *widget.RichText {
-		rt := widget.NewRichText(&widget.TextSegment{
-			Text: text,
-			Style: widget.RichTextStyle{
-				SizeName: theme.SizeNameCaptionText,
-			},
+	metaLabel := widget.NewLabel("Reading file details…")
+	metaRow := container.NewBorder(nil, nil, nil, metaLabel, widget.NewProgressBarInfinite())
+	metaRow.Hide()
+
+	emptyText := widget.NewRichText()
+	emptyText.Wrapping = fyne.TextWrapWord
+	emptyView := container.NewVScroll(emptyText)
+
+	var list *widget.List
+	var refreshView func()
+	var updateSamples func()
+	strip := container.NewHBox() // summary strip: counts by outcome
+	viewBtns := map[string]*widget.Button{}
+	for _, mode := range []string{viewAll, viewChanged, viewProblems} {
+		mode := mode
+		viewBtns[mode] = widget.NewButton(mode, func() {
+			state.viewMode = mode
+			state.problemKind = rowNone
+			refreshView()
 		})
-		rt.Wrapping = fyne.TextWrapWord
-		return rt
 	}
 
-	selCount := func() int {
-		n := 0
-		for _, p := range state.filteredFiles {
-			if !state.deselected[p] {
-				n++
-			}
-		}
-		return n
-	}
-
-	// forward declaration: renderPreview and updatePageView reference each other
-	var updatePageView func()
-
-	renderPreview := func() {
-		previewBox.Objects = nil
-
-		h0 := widget.NewLabelWithStyle("✓", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
-		h1 := widget.NewLabelWithStyle("Original (full file name)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-		h2 := widget.NewLabelWithStyle("Preview (after rename steps)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-		previewBox.Add(container.NewGridWithColumns(3, h0, h1, h2))
-		previewBox.Add(widget.NewSeparator())
-
-		for _, full := range state.viewFiles {
-			full := full // per-iteration variable for closure
-			origName := filepath.Base(full)
-			prevName := applyRenameSteps(origName, state.steps)
-
-			warn := ""
-			if reason := invalidNameReason(prevName); reason != "" {
-				warn = "  ⚠ " + reason
-			} else if !state.deselected[full] {
-				// only show conflict warning for selected files
-				dirKey := filepath.Dir(full) + "\x00" + prevName
-				if state.previewCounts[dirKey] > 1 && prevName != origName {
-					warn = "  ⚠ conflict"
-				} else if prevName != origName {
-					target := filepath.Join(filepath.Dir(full), prevName)
-					if _, err := os.Stat(target); err == nil {
-						warn = "  ⚠ target exists"
-					}
-				}
-			}
-
-			chk := widget.NewCheck("", func(checked bool) {
-				if checked {
-					delete(state.deselected, full)
-				} else {
-					state.deselected[full] = true
-				}
-				recomputePreviewCounts(state)
-				updatePageView()
-			})
-			chk.Checked = !state.deselected[full] // direct field set; SetChecked would trigger OnChanged → infinite loop
-
-			previewBox.Add(container.NewGridWithColumns(3,
-				chk,
-				makeCell(origName),
-				makeCell(prevName+warn),
-			))
-			previewBox.Add(widget.NewSeparator())
-		}
-		previewBox.Refresh()
-	}
-
-	/* -------------------- Pagination -------------------- */
-
-	prevBtn := widget.NewButton("Previous", nil)
-	nextBtn := widget.NewButton("Next", nil)
-	pageLabel := widget.NewLabel("Page 1/1")
-	pageLabel.Alignment = fyne.TextAlignCenter
-
-	updatePageView = func() {
-		totalMatches := len(state.filteredFiles)
-		totalFiles := len(state.allFiles)
-
-		pages := pageCount(totalMatches, state.pageSize)
-		state.page = clamp(state.page, 0, pages-1)
-
-		start := state.page * state.pageSize
-		end := start + state.pageSize
-		if start > totalMatches {
-			start = totalMatches
-		}
-		if end > totalMatches {
-			end = totalMatches
-		}
-
-		state.viewFiles = state.filteredFiles[start:end]
-
-		sel := selCount()
-		if totalMatches == 0 {
-			resultsHeader.SetText(fmt.Sprintf("No matches (0 of %d files).", totalFiles))
+	toggleFile := func(full string, checked bool) {
+		if checked {
+			delete(state.deselected, full)
 		} else {
-			resultsHeader.SetText(fmt.Sprintf(
-				"Showing %d–%d of %d matches · %d selected · %d total files.",
-				start+1, end, totalMatches, sel, totalFiles,
-			))
+			state.deselected[full] = true
 		}
-
-		pageLabel.SetText(fmt.Sprintf("Page %d/%d", state.page+1, pages))
-
-		prevBtn.Disable()
-		nextBtn.Disable()
-		if state.page > 0 && totalMatches > 0 {
-			prevBtn.Enable()
-		}
-		if state.page < pages-1 && totalMatches > 0 {
-			nextBtn.Enable()
-		}
-
-		renderPreview()
+		recomputePreview(state)
+		refreshView()
 	}
 
-	prevBtn.OnTapped = func() { state.page--; updatePageView() }
-	nextBtn.OnTapped = func() { state.page++; updatePageView() }
+	// rowView computes what a row shows. stat=false skips the (disk-touching)
+	// "target exists" check, which is only done for rows actually on screen.
+	rowView := func(full string, stat bool) rowInfo {
+		orig := filepath.Base(full)
+		if state.deselected[full] {
+			return rowInfo{orig: orig, parts: []diffPart{{text: orig}}, note: "   (not selected)", kind: widget.LowImportance}
+		}
+		name := state.previewNames[full]
+		changed := name != orig
+		info := rowInfo{orig: orig, parts: []diffPart{{text: name}}, kind: widget.MediumImportance, selected: true}
+		if changed && stat { // the (costlier) character diff is only needed for rows on screen
+			info.parts = diffRunes(orig, name)
+		}
+		switch {
+		case changed && rename.InvalidReason(name) != "":
+			info.note = "  ⚠ " + rename.InvalidReason(name)
+			info.kind = widget.DangerImportance
+		case changed && state.previewCounts[rename.DupKey(filepath.Dir(full), name)] > 1:
+			info.note = "  ⚠ conflict: another file gets the same name"
+			info.kind = widget.WarningImportance
+		case changed && stat && rename.TargetBlocked(full, filepath.Join(filepath.Dir(full), name)):
+			info.note = "  ⚠ target exists"
+			info.kind = widget.WarningImportance
+		case !changed && state.hasActiveSteps():
+			info.note = "  (unchanged)"
+			info.kind = widget.LowImportance
+		}
+		if changed && state.sidecars && info.kind == widget.MediumImportance {
+			if n := relatedCount(state, full); n > 0 {
+				info.note = fmt.Sprintf("  (+%d related)", n)
+			}
+		}
+		return info
+	}
+
+	list = widget.NewList(
+		func() int { return len(state.visible) },
+		func() fyne.CanvasObject { return newFileRow(&state.colRatio) },
+		func(id widget.ListItemID, o fyne.CanvasObject) {
+			if id >= len(state.visible) {
+				return
+			}
+			full := state.visible[id]
+			o.(*fileRow).set(rowView(full, true), func(checked bool) { toggleFile(full, checked) })
+		},
+	)
+
+	// updateRowHeights gives rows with long names enough height to wrap. The
+	// number of lines is estimated from the text length and the average glyph
+	// width (cheap, so it also works for tens of thousands of files).
+	rowBase := newFileRow(&state.colRatio).MinSize().Height
+	updateRowHeights := func() {
+		if state.listWidth <= 0 {
+			return
+		}
+		th := fyne.CurrentApp().Settings().Theme()
+		textSize := th.Size(theme.SizeNameText)
+		sample := "The quick brown fox jumps over 0123456789 _-.() lazy dogs"
+		sz, _ := fyne.CurrentApp().Driver().RenderedTextSize(sample, textSize, fyne.TextStyle{}, nil)
+		avg := sz.Width / float32(utf8.RuneCountInString(sample))
+		lineH := sz.Height
+
+		inner := th.Size(theme.SizeNameInnerPadding)
+		total := state.listWidth - 36 - 14 - th.Size(theme.SizeNamePadding)
+		colO := total*state.colRatio - 2*inner
+		colP := total*(1-state.colRatio) - 4*inner // the preview text sits in an extra padded box
+		if colO < 50 {
+			colO = 50
+		}
+		if colP < 50 {
+			colP = 50
+		}
+		lines := func(chars int, colW float32) int {
+			n := int(math.Ceil(float64(float32(chars) * avg * 1.15 / colW)))
+			if n < 1 {
+				n = 1
+			}
+			return n
+		}
+		for i, p := range state.visible {
+			info := rowView(p, false)
+			n := lines(utf8.RuneCountInString(info.orig), colO)
+			if m := lines(info.previewLen(), colP); m > n {
+				n = m
+			}
+			list.SetItemHeight(i, rowBase+float32(n-1)*lineH)
+		}
+	}
+	list.OnSelected = func(widget.ListItemID) { list.UnselectAll() }
+
+	// updateStrip rebuilds the summary line: "12 will rename · 3 invalid · 40 unchanged".
+	// Clicking a problem count shows just those files.
+	updateStrip := func() {
+		strip.Objects = nil
+		defer strip.Refresh()
+		if state.folderPath == "" || state.scanning || len(state.filteredFiles) == 0 || !state.hasActiveSteps() {
+			return
+		}
+		c := state.kindCounts
+		strip.Add(widget.NewLabelWithStyle(fmt.Sprintf("%d will rename", c[rowOK]), fyne.TextAlignLeading, fyne.TextStyle{Bold: true}))
+		problem := func(kind rowKind, label string, imp widget.Importance) {
+			if c[kind] == 0 {
+				return
+			}
+			b := widget.NewButton(fmt.Sprintf("%d %s", c[kind], label), func() {
+				state.viewMode, state.problemKind = viewProblems, kind
+				refreshView()
+			})
+			b.Importance = imp
+			strip.Add(b)
+		}
+		problem(rowInvalid, "invalid", widget.DangerImportance)
+		problem(rowDup, "duplicate names", widget.WarningImportance)
+		problem(rowTaken, "name taken", widget.WarningImportance)
+		if c[rowUnchanged] > 0 {
+			lbl := widget.NewLabel(fmt.Sprintf("%d unchanged", c[rowUnchanged]))
+			lbl.Importance = widget.LowImportance
+			strip.Add(lbl)
+		}
+	}
+
+	refreshView = func() {
+		rebuildVisible(state)
+		total, matches := len(state.allFiles), len(state.filteredFiles)
+
+		switch {
+		case state.folderPath == "":
+			resultsHeader.SetText("No folder selected. Click “Select Folder…” to begin.")
+			emptyText.ParseMarkdown(welcomeMarkdown)
+		case state.scanning:
+			resultsHeader.SetText("Scanning folder…")
+			emptyText.ParseMarkdown("Scanning the folder, please wait…")
+		case matches == 0:
+			resultsHeader.SetText(fmt.Sprintf("No matches (0 of %d files).", total))
+			if total > 0 {
+				emptyText.ParseMarkdown("No files match your filters. Change or clear the filters on the left.")
+			} else {
+				emptyText.ParseMarkdown("This folder has no files. Tick **Include subfolders** to look inside sub-folders.")
+			}
+		case len(state.visible) == 0:
+			resultsHeader.SetText(fmt.Sprintf("%d matches · %d selected · %d total files.", matches, len(state.previewNames), total))
+			if state.viewMode == viewProblems {
+				emptyText.ParseMarkdown("**No problems found.** Every selected file can be renamed safely.")
+			} else {
+				emptyText.ParseMarkdown("**Nothing would change** with the current steps and selection.")
+			}
+		default:
+			resultsHeader.SetText(fmt.Sprintf("%d matches · %d selected · %d total files.",
+				matches, len(state.previewNames), total))
+		}
+
+		// view buttons with live counts
+		counts := map[string]int{viewAll: matches, viewChanged: state.nChanged, viewProblems: state.nProblems}
+		for mode, btn := range viewBtns {
+			btn.SetText(fmt.Sprintf("%s (%d)", mode, counts[mode]))
+			switch {
+			case mode == state.viewMode:
+				btn.Importance = widget.HighImportance
+			case mode == viewProblems && counts[mode] > 0:
+				btn.Importance = widget.WarningImportance
+			default:
+				btn.Importance = widget.MediumImportance
+			}
+			btn.Refresh()
+		}
+		updateStrip()
+
+		if len(state.visible) == 0 || state.folderPath == "" {
+			list.Hide()
+			emptyView.Show()
+		} else {
+			emptyView.Hide()
+			list.Show()
+		}
+		updateRowHeights()
+		list.Refresh()
+		if updateSamples != nil {
+			updateSamples()
+		}
+	}
 
 	/* -------------------- Select All / Deselect All -------------------- */
 
+	// Select All / Deselect All act on the rows currently listed (see "Show").
 	selectAllBtn := widget.NewButton("Select All", func() {
-		state.deselected = map[string]bool{}
-		recomputePreviewCounts(state)
-		updatePageView()
+		for _, p := range state.visible {
+			delete(state.deselected, p)
+		}
+		recomputePreview(state)
+		refreshView()
 	})
 
 	deselectAllBtn := widget.NewButton("Deselect All", func() {
-		for _, p := range state.filteredFiles {
+		for _, p := range state.visible {
 			state.deselected[p] = true
 		}
-		recomputePreviewCounts(state)
-		updatePageView()
+		recomputePreview(state)
+		refreshView()
 	})
 
+	var headerCols *fyne.Container
+	headerCols = container.New(&twoCol{ratio: &state.colRatio},
+		widget.NewLabelWithStyle("Original (full file name)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabelWithStyle("Preview (changes highlighted)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		newDragHandle(func(dx float32) {
+			total := state.listWidth - 36 - 14 - theme.Padding()
+			if total <= 0 {
+				return
+			}
+			r := state.colRatio + dx/total
+			if r < 0.2 {
+				r = 0.2
+			} else if r > 0.8 {
+				r = 0.8
+			}
+			state.colRatio = r
+			headerCols.Refresh()
+			updateRowHeights()
+			list.Refresh()
+		}, func() { a.Preferences().SetFloat(colRatioKey, float64(state.colRatio)) }),
+	)
+	columnHeader := container.NewBorder(nil, nil,
+		widget.NewLabelWithStyle("✓", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}), nil,
+		headerCols)
+
+	var ensureMeta func()
+	sortSelect := widget.NewSelect(sortModes, func(mode string) {
+		state.sortMode = mode
+		applyAll(state)
+		refreshView()
+		ensureMeta()
+	})
+	sortSelect.Selected = state.sortMode
+
 	rightTop := container.NewVBox(
-		container.NewBorder(nil, nil, nil,
-			container.NewHBox(prevBtn, pageLabel, nextBtn),
-			resultsHeader,
+		resultsHeader,
+		container.NewBorder(nil, nil,
+			container.NewHBox(selectAllBtn, deselectAllBtn),
+			container.NewHBox(widget.NewLabel("Order:"), sortSelect),
 		),
-		container.NewHBox(selectAllBtn, deselectAllBtn),
+		container.NewHBox(widget.NewLabel("Show:"), viewBtns[viewAll], viewBtns[viewChanged], viewBtns[viewProblems]),
+		strip,
+		scanRow,
+		metaRow,
 		widget.NewSeparator(),
+		columnHeader,
 	)
 
-	/* -------------------- Bottom Actions (Dry Run / Apply / Undo CSV) -------------------- */
+	/* -------------------- Background metadata loading -------------------- */
+
+	// ensureMeta loads file details (size, dates, EXIF) that the current steps
+	// or sort order need, off the UI thread, then refreshes the preview.
+	ensureMeta = func() {
+		need := state.neededMeta()
+		if state.cancelMeta != nil {
+			state.cancelMeta()
+			state.cancelMeta = nil
+		}
+		state.metaID++
+		id := state.metaID
+		if state.scanning || need == meta.None || meta.Missing(state.filteredFiles, need) == 0 {
+			metaRow.Hide()
+			return
+		}
+		files := append([]string(nil), state.filteredFiles...)
+		ctx, cancel := context.WithCancel(context.Background())
+		state.cancelMeta = cancel
+		metaLabel.SetText("Reading file details…")
+		metaRow.Show()
+		go func() {
+			err := meta.Ensure(ctx, files, need, func(done, total int) {
+				fyne.Do(func() {
+					if state.metaID == id {
+						metaLabel.SetText(fmt.Sprintf("Reading file details… %d / %d", done, total))
+					}
+				})
+			})
+			fyne.Do(func() {
+				if state.metaID != id || err != nil {
+					return
+				}
+				metaRow.Hide()
+				applyAll(state)
+				refreshView()
+			})
+		}()
+	}
+
+	/* -------------------- Background folder scan -------------------- */
+
+	// reloadFiles rescans the folder off the UI thread. A newer scan cancels an
+	// older one. done (optional) receives whether the scan succeeded.
+	reloadFiles := func(keepSelection bool, done func(ok bool)) {
+		if state.cancelScan != nil {
+			state.cancelScan()
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		state.cancelScan = cancel
+		state.scanID++
+		id := state.scanID
+		folder, recursive := state.folderPath, state.recursive
+
+		state.scanning = true
+		if !keepSelection {
+			meta.Reset()
+			state.allFiles, state.deselected = nil, map[string]bool{}
+			applyAll(state)
+		}
+		scanLabel.SetText("")
+		scanRow.Show()
+		refreshView()
+
+		go func() {
+			files, err := rename.ListFiles(ctx, folder, recursive, func(n int) {
+				fyne.Do(func() {
+					if state.scanID == id {
+						scanLabel.SetText(fmt.Sprintf("%d files…", n))
+					}
+				})
+			})
+			fyne.Do(func() {
+				if state.scanID != id { // superseded by a newer scan
+					return
+				}
+				state.scanning = false
+				scanRow.Hide()
+				if err != nil {
+					dialog.ShowError(err, w)
+					state.allFiles = nil
+				} else {
+					state.allFiles = files
+				}
+				applyAll(state)
+				refreshView()
+				ensureMeta()
+				if done != nil {
+					done(err == nil)
+				}
+			})
+		}()
+	}
+
+	/* -------------------- Bottom Actions (Dry Run / Apply / Undo) -------------------- */
 
 	dryRunCheck := widget.NewCheck("Dry run (don't rename)", nil)
 	dryRunCheck.SetChecked(true)
@@ -298,129 +644,258 @@ func main() {
 	undoLogCheck := widget.NewCheck("Create undo log (CSV)", nil)
 	undoLogCheck.SetChecked(true)
 
-	applyBtn := widget.NewButtonWithIcon("Apply", theme.ConfirmIcon(), func() {
-		if state.folderPath == "" || len(state.filteredFiles) == 0 {
-			dialog.ShowInformation("Nothing to do", "Select a folder and ensure you have matching files.", w)
+	// chooseUndoLog asks where to save the undo log, then calls run with the
+	// chosen path ("" means no log). Cancelling the dialog asks before going on.
+	chooseUndoLog := func(run func(logPath string)) {
+		if !undoLogCheck.Checked {
+			run("")
 			return
 		}
-		if selCount() == 0 {
-			dialog.ShowInformation("Nothing selected", "No files are selected for rename. Use the checkboxes or Select All.", w)
-			return
-		}
-
-		plan, summary := buildPlan(state)
-		msg := buildConfirmMessage(summary)
-
-		doWithOptionalCSV := func(onSaved func(savePath string)) {
-			if !undoLogCheck.Checked {
-				onSaved("")
+		d := dialog.NewFileSave(func(uc fyne.URIWriteCloser, err error) {
+			if err != nil {
+				dialog.ShowError(err, w)
 				return
 			}
-			saveName := fmt.Sprintf("undo_log_%s.csv", time.Now().Format("20060102_150405"))
-			d := dialog.NewFileSave(func(uc fyne.URIWriteCloser, err error) {
-				if err != nil || uc == nil {
-					onSaved("")
-					return
-				}
-				defer uc.Close()
-				if err := writeUndoCSV(uc, plan); err != nil {
-					dialog.ShowError(err, w)
-					onSaved("")
-					return
-				}
-				onSaved(uc.URI().Path())
-			}, w)
-			d.SetFileName(saveName)
-			d.Show()
+			if uc == nil { // cancelled
+				dialog.ShowConfirm("No undo log",
+					"You did not choose where to save the undo log.\n\nContinue WITHOUT an undo log?",
+					func(yes bool) {
+						if yes {
+							run("")
+						}
+					}, w)
+				return
+			}
+			path := uc.URI().Path()
+			_ = uc.Close()
+			run(path)
+		}, w)
+		d.SetFileName(fmt.Sprintf("undo_log_%s.csv", time.Now().Format("20060102_150405")))
+		if lister, err := storage.ListerForURI(storage.NewFileURI(state.folderPath)); err == nil {
+			d.SetLocation(lister)
+		}
+		d.Show()
+	}
+
+	saveLog := func(path string, items []rename.Item) string {
+		if path == "" {
+			return ""
+		}
+		if err := undo.WriteFile(path, items); err != nil {
+			dialog.ShowError(fmt.Errorf("could not write the undo log: %w", err), w)
+			return ""
+		}
+		return path
+	}
+
+	var showConfirm func(plan []rename.Item, summary rename.Summary)
+
+	applyBtn := widget.NewButtonWithIcon("Apply", theme.ConfirmIcon(), func() {
+		switch {
+		case state.scanning:
+			dialog.ShowInformation("Please wait", "The folder is still being scanned.", w)
+			return
+		case state.folderPath == "" || len(state.filteredFiles) == 0:
+			dialog.ShowInformation("Nothing to do", "Select a folder and make sure some files match your filters.", w)
+			return
+		case len(state.selected()) == 0:
+			dialog.ShowInformation("Nothing selected", "No files are selected. Use the checkboxes or Select All.", w)
+			return
+		case !state.hasActiveSteps():
+			dialog.ShowInformation("No rename steps", "Add at least one enabled rename step first (“+ Add rename step”).", w)
+			return
 		}
 
+		files := state.selected()
+		steps := append([]rename.Step(nil), state.steps...)
+		opt := rename.PlanOptions{Sidecars: state.sidecars, SidecarExts: state.sidecarExts, All: state.allFiles}
+		var plan []rename.Item
+		var summary rename.Summary
+		runBusy("Preparing rename plan…", func() { plan, summary = rename.BuildPlan(files, steps, opt) }, func() {
+			if summary.OkCount == 0 {
+				dialog.ShowInformation("Nothing to rename", buildConfirmMessage(summary, false), w)
+				return
+			}
+			showConfirm(plan, summary)
+		})
+	})
+
+	showConfirm = func(plan []rename.Item, summary rename.Summary) {
 		confirm := dialog.NewCustomConfirm("Confirm rename", "Proceed", "Cancel",
-			container.NewVScroll(widget.NewLabel(msg)),
+			container.NewVScroll(widget.NewLabel(buildConfirmMessage(summary, dryRunCheck.Checked))),
 			func(ok bool) {
 				if !ok {
 					return
 				}
-
-				doWithOptionalCSV(func(savedCSV string) {
+				chooseUndoLog(func(logPath string) {
 					if dryRunCheck.Checked {
 						for i := range plan {
-							if plan[i].Status == "ok" {
-								plan[i].Status = "dry-run"
+							if plan[i].Status == rename.StatusOK {
+								plan[i].Status = rename.StatusDryRun
 							}
 						}
+						saved := saveLog(logPath, plan)
 						dialog.ShowInformation("Dry run complete", fmt.Sprintf(
-							"%s\n\nUndo CSV: %s",
-							buildResultMessage(plan, true),
-							prettyPath(savedCSV),
-						), w)
+							"%s\n\nNo files were changed. Untick “Dry run” and click Apply to rename for real.\n\nPlan CSV: %s",
+							buildResultMessage(plan, true), prettyPath(saved)), w)
 						return
 					}
 
-					applyResults := applyRenames(plan)
-
-					if savedCSV != "" {
-						_ = overwriteUndoCSV(savedCSV, applyResults)
-					}
-
-					dialog.ShowInformation("Apply complete", fmt.Sprintf(
-						"%s\n\nUndo CSV: %s",
-						buildResultMessage(applyResults, false),
-						prettyPath(savedCSV),
-					), w)
-
-					files, err := listAllFiles(state.folderPath, state.recursive)
-					if err == nil {
-						state.allFiles = files
-						applyAll(state)
-						updatePageView()
-					}
+					var results []rename.Item
+					runBusy("Renaming files…", func() { results = rename.Execute(plan) }, func() {
+						saved := saveLog(logPath, results)
+						if saved != "" {
+							a.Preferences().SetString(lastUndoLogKey, saved)
+						}
+						msg := fmt.Sprintf("%s\n\nUndo log: %s", buildResultMessage(results, false), prettyPath(saved))
+						dialog.ShowInformation("Apply complete", msg+strandedMessage(results), w)
+						reloadFiles(true, nil)
+					})
 				})
 			},
 			w,
 		)
-		confirm.Resize(fyne.NewSize(700, 420))
+		if len(summary.Invalid)+len(summary.Duplicate)+len(summary.TargetExists)+len(summary.GroupSkipped) > 0 {
+			confirm.Resize(fyne.NewSize(700, 420)) // room for the lists of skipped files
+		} else {
+			confirm.Resize(fyne.NewSize(500, 280))
+		}
 		confirm.Show()
+	}
+
+	// runUndo reverts the rename log at path after confirmation.
+	runUndo := func(path string) {
+		entries, err := undo.ReadFile(path)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("could not read %s: %w", path, err), w)
+			return
+		}
+		plan, sum := undo.BuildRevertPlan(entries)
+		if sum.Total == 0 {
+			dialog.ShowInformation("Nothing to undo",
+				"This log contains no completed renames (it may be from a dry run).", w)
+			return
+		}
+		if sum.Ready == 0 {
+			dialog.ShowInformation("Cannot undo", buildUndoMessage(sum, path), w)
+			return
+		}
+		dialog.ShowConfirm("Undo renames", buildUndoMessage(sum, path), func(ok bool) {
+			if !ok {
+				return
+			}
+			var results []rename.Item
+			runBusy("Restoring names…", func() { results = rename.Execute(plan) }, func() {
+				restored, _, errs := rename.Counts(results)
+				if errs == 0 && len(sum.Missing) == 0 && len(sum.Blocked) == 0 {
+					a.Preferences().SetString(lastUndoLogKey, "")
+				}
+				dialog.ShowInformation("Undo complete",
+					fmt.Sprintf("Restored: %d\nErrors: %d", restored, errs)+strandedMessage(results), w)
+				if state.folderPath != "" {
+					reloadFiles(true, nil)
+				}
+			})
+		}, w)
+	}
+
+	chooseUndoFile := func() {
+		d := dialog.NewFileOpen(func(rc fyne.URIReadCloser, err error) {
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			if rc == nil {
+				return
+			}
+			path := rc.URI().Path()
+			_ = rc.Close()
+			runUndo(path)
+		}, w)
+		d.SetFilter(storage.NewExtensionFileFilter([]string{".csv"}))
+		if state.folderPath != "" {
+			if lister, err := storage.ListerForURI(storage.NewFileURI(state.folderPath)); err == nil {
+				d.SetLocation(lister)
+			}
+		}
+		d.Show()
+	}
+
+	undoBtn := widget.NewButtonWithIcon("Undo…", theme.HistoryIcon(), func() {
+		last := a.Preferences().String(lastUndoLogKey)
+		if last != "" {
+			if _, err := os.Stat(last); err == nil {
+				dialog.NewCustomConfirm("Undo a rename",
+					"Use last log", "Choose another…",
+					widget.NewLabel("Restore the original names using the most recent undo log?\n\n"+last),
+					func(useLast bool) {
+						if useLast {
+							runUndo(last)
+						} else {
+							chooseUndoFile()
+						}
+					}, w).Show()
+				return
+			}
+		}
+		chooseUndoFile()
 	})
 
 	actionsBar := container.NewBorder(
 		nil, nil,
 		container.NewHBox(dryRunCheck, undoLogCheck),
-		nil,
-		applyBtn,
+		container.NewHBox(undoBtn, applyBtn),
 	)
 
 	right := container.NewBorder(
 		rightTop,
 		actionsBar,
 		nil, nil,
-		container.NewVScroll(previewBox),
+		container.New(&resizeWatcher{onWidth: func(w float32) {
+			state.listWidth = w
+			updateRowHeights()
+			list.Refresh()
+		}}, container.NewStack(list, emptyView)),
 	)
 
 	/* -------------------- Left: Filters + Steps -------------------- */
 
 	applyAllUI := func() {
 		applyAll(state)
-		updatePageView()
+		refreshView()
+		ensureMeta()
 	}
 
 	// Filters UI
-	matchModeSelect := widget.NewSelect([]string{"Match ALL (AND)", "Match ANY (OR)"}, func(sel string) {
-		state.matchAll = (sel == "Match ALL (AND)")
+	const matchAllLabel, matchAnyLabel = "Match ALL (AND)", "Match ANY (OR)"
+	matchModeSelect := widget.NewSelect([]string{matchAllLabel, matchAnyLabel}, func(sel string) {
+		state.matchAll = (sel == matchAllLabel)
 		applyAllUI()
 	})
-	matchModeSelect.SetSelected("Match ALL (AND)")
+	matchModeSelect.SetSelected(matchAllLabel)
 
 	caseSensitiveCheck := widget.NewCheck("Case sensitive", func(v bool) {
 		state.caseSensitive = v
 		applyAllUI()
 	})
 
+	updateRule := func(id int, f func(*filter.Rule)) {
+		for i := range state.filters {
+			if state.filters[i].ID == id {
+				f(&state.filters[i])
+				return
+			}
+		}
+	}
+
 	filtersBox := container.NewVBox()
 	var renderFilters func()
 	renderFilters = func() {
 		filtersBox.Objects = nil
 		if len(state.filters) == 0 {
-			filtersBox.Add(widget.NewLabel("No filters added. Add one to narrow down files."))
+			lbl := widget.NewLabel("No filters: all files are included. Click “+ Add filter” to narrow them down.")
+			lbl.Wrapping = fyne.TextWrapWord
+			filtersBox.Add(lbl)
 			filtersBox.Refresh()
 			return
 		}
@@ -428,52 +903,67 @@ func main() {
 		for _, rule := range state.filters {
 			rid := rule.ID
 
-			modeSel := widget.NewSelect([]string{"contains", "starts with", "ends with", "extension"}, func(sel string) {
-				for i := range state.filters {
-					if state.filters[i].ID == rid {
-						state.filters[i].Mode = sel
-						break
-					}
+			errLbl := widget.NewLabel("")
+			errLbl.Importance = widget.DangerImportance
+			errLbl.Wrapping = fyne.TextWrapWord
+			showErr := func() {
+				msg := ""
+				updateRule(rid, func(r *filter.Rule) { msg = filter.Validate(*r) })
+				errLbl.SetText(msg)
+				if msg == "" {
+					errLbl.Hide()
+				} else {
+					errLbl.Show()
 				}
+			}
+			showErr()
+
+			modeSel := widget.NewSelect(filter.Modes, func(sel string) {
+				changed := false
+				updateRule(rid, func(r *filter.Rule) { changed = r.Mode != sel; r.Mode = sel })
+				if !changed {
+					return
+				}
+				renderFilters() // refresh the hint for the new mode
 				applyAllUI()
 			})
-			modeSel.SetSelected(rule.Mode)
+			modeSel.Selected = rule.Mode // direct set: avoid re-triggering OnChanged
 
 			valEntry := widget.NewEntry()
 			valEntry.SetText(rule.Value)
-			valEntry.SetPlaceHolder(`value… e.g. The, Whale, png`)
+			valEntry.SetPlaceHolder(`value… e.g. IMG_, holiday, png`)
 			valEntry.OnChanged = func(s string) {
-				for i := range state.filters {
-					if state.filters[i].ID == rid {
-						state.filters[i].Value = s
-						break
-					}
-				}
+				updateRule(rid, func(r *filter.Rule) { r.Value = s })
+				showErr()
 				applyAllUI()
 			}
 
-			removeBtn := widget.NewButton("✕", func() {
-				next := state.filters[:0]
+			removeBtn := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {
+				next := make([]filter.Rule, 0, len(state.filters))
 				for _, r := range state.filters {
 					if r.ID != rid {
 						next = append(next, r)
 					}
 				}
-				state.filters = append([]FilterRule(nil), next...)
+				state.filters = next
 				renderFilters()
 				applyAllUI()
 			})
 
+			hint := widget.NewLabelWithStyle(filterHelp[rule.Mode], fyne.TextAlignLeading, fyne.TextStyle{Italic: true})
+			hint.Wrapping = fyne.TextWrapWord
+
 			filtersBox.Add(container.NewBorder(nil, nil, nil, removeBtn,
-				container.NewGridWithColumns(2, modeSel, valEntry),
+				container.NewVBox(container.NewGridWithColumns(2, modeSel, valEntry), hint, errLbl),
 			))
+			filtersBox.Add(widget.NewSeparator())
 		}
 		filtersBox.Refresh()
 	}
 
 	addFilterBtn := widget.NewButton("+ Add filter", func() {
 		state.nextFilterID++
-		state.filters = append(state.filters, FilterRule{ID: state.nextFilterID, Mode: "contains", Value: ""})
+		state.filters = append(state.filters, filter.Rule{ID: state.nextFilterID, Mode: filter.Contains})
 		renderFilters()
 		applyAllUI()
 	})
@@ -485,106 +975,278 @@ func main() {
 	})
 
 	// Steps UI
+	opNames := make([]string, len(rename.AllOps))
+	for i, op := range rename.AllOps {
+		opNames[i] = string(op)
+	}
+
+	updateStep := func(id int, f func(*rename.Step)) {
+		for i := range state.steps {
+			if state.steps[i].ID == id {
+				f(&state.steps[i])
+				return
+			}
+		}
+	}
+
 	stepsBox := container.NewVBox()
 	var renderSteps func()
+	collapsed := map[int]bool{} // step ID -> shown as a one-line summary
+	var sampleFns []func()
+
+	moveStep := func(id, delta int) {
+		for i := range state.steps {
+			if state.steps[i].ID == id {
+				j := i + delta
+				if j < 0 || j >= len(state.steps) {
+					return
+				}
+				state.steps[i], state.steps[j] = state.steps[j], state.steps[i]
+				break
+			}
+		}
+		renderSteps()
+		applyAllUI()
+	}
+
 	renderSteps = func() {
 		stepsBox.Objects = nil
+		sampleFns = nil
+		if len(state.steps) > 1 {
+			setAll := func(v bool) {
+				for _, st := range state.steps {
+					collapsed[st.ID] = v
+				}
+				renderSteps()
+			}
+			collapseAll := widget.NewButton("Collapse all", func() { setAll(true) })
+			expandAll := widget.NewButton("Expand all", func() { setAll(false) })
+			collapseAll.Importance, expandAll.Importance = widget.LowImportance, widget.LowImportance
+			stepsBox.Add(container.NewHBox(collapseAll, expandAll))
+		}
 		if len(state.steps) == 0 {
-			stepsBox.Add(widget.NewLabel("No rename steps. Add one to preview name changes."))
+			lbl := widget.NewLabel("No rename steps yet. Click “+ Add rename step” (or load a preset); the preview updates as you type.")
+			lbl.Wrapping = fyne.TextWrapWord
+			stepsBox.Add(lbl)
 			stepsBox.Refresh()
 			return
 		}
 
-		for _, step := range state.steps {
+		for n := range state.steps {
+			n, step := n, state.steps[n]
 			sid := step.ID
 
-			opSel := widget.NewSelect([]string{
-				string(OpRemoveText),
-				string(OpReplaceText),
-				string(OpInsertBeforeExt),
-				string(OpChangeExt),
-				string(OpAppend),
-				string(OpPrepend),
-			}, func(sel string) {
-				for i := range state.steps {
-					if state.steps[i].ID == sid {
-						state.steps[i].Op = RenameOp(sel)
-						break
-					}
-				}
-				applyAllUI()
-			})
-			opSel.SetSelected(string(step.Op))
-
-			a := widget.NewEntry()
-			a.SetText(step.A)
-			b := widget.NewEntry()
-			b.SetText(step.B)
-
-			a.SetPlaceHolder("A")
-			b.SetPlaceHolder("B (Replace only)")
-			b.Enable()
-
-			switch step.Op {
-			case OpRemoveText:
-				a.SetPlaceHolder(`text to remove (e.g. vivek)`)
-				b.Disable()
-			case OpReplaceText:
-				a.SetPlaceHolder(`find (e.g. vivek)`)
-				b.SetPlaceHolder(`replace with (e.g. Vivek)`)
-			case OpInsertBeforeExt, OpAppend:
-				a.SetPlaceHolder(`insert (e.g. (awesome))`)
-				b.Disable()
-			case OpPrepend:
-				a.SetPlaceHolder(`prepend (e.g. NEW_)`)
-				b.Disable()
-			case OpChangeExt:
-				a.SetPlaceHolder(`new ext (e.g. xyz or .xyz)`)
-				b.Disable()
+			// pick-list ops always hold a valid option
+			if opts := rename.Options(step.Op); opts != nil && !contains(opts, step.A) {
+				state.steps[n].A = opts[0]
+				step.A = opts[0]
 			}
 
-			a.OnChanged = func(v string) {
-				for i := range state.steps {
-					if state.steps[i].ID == sid {
-						state.steps[i].A = v
-						break
-					}
+			errLbl := widget.NewLabel("")
+			errLbl.Importance = widget.DangerImportance
+			errLbl.Wrapping = fyne.TextWrapWord
+			showErr := func() {
+				msg := ""
+				updateStep(sid, func(s *rename.Step) { msg = rename.ValidateStep(*s) })
+				errLbl.SetText(msg)
+				if msg == "" {
+					errLbl.Hide()
+				} else {
+					errLbl.Show()
 				}
-				applyAllUI()
 			}
-			b.OnChanged = func(v string) {
-				for i := range state.steps {
-					if state.steps[i].ID == sid {
-						state.steps[i].B = v
-						break
-					}
-				}
+			showErr()
+
+			enabled := widget.NewCheck(fmt.Sprintf("Step %d", n+1), nil)
+			enabled.Checked = !step.Disabled
+			enabled.OnChanged = func(on bool) {
+				updateStep(sid, func(s *rename.Step) { s.Disabled = !on })
 				applyAllUI()
 			}
 
-			remove := widget.NewButton("✕", func() {
-				next := state.steps[:0]
+			upBtn := widget.NewButtonWithIcon("", theme.MoveUpIcon(), func() { moveStep(sid, -1) })
+			downBtn := widget.NewButtonWithIcon("", theme.MoveDownIcon(), func() { moveStep(sid, 1) })
+			if n == 0 {
+				upBtn.Disable()
+			}
+			if n == len(state.steps)-1 {
+				downBtn.Disable()
+			}
+			remove := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {
+				next := make([]rename.Step, 0, len(state.steps))
 				for _, s := range state.steps {
 					if s.ID != sid {
 						next = append(next, s)
 					}
 				}
-				state.steps = append([]RenameStep(nil), next...)
+				state.steps = next
 				renderSteps()
 				applyAllUI()
 			})
 
-			stepsBox.Add(container.NewBorder(nil, nil, nil, remove,
-				container.NewVBox(opSel, container.NewGridWithColumns(2, a, b)),
-			))
+			opSel := widget.NewSelect(opNames, func(sel string) {
+				changed := false
+				updateStep(sid, func(s *rename.Step) {
+					newOp := rename.Op(sel)
+					if s.Op == newOp {
+						return
+					}
+					changed = true
+					if rename.Options(s.Op) != nil || rename.Options(newOp) != nil {
+						s.A, s.B = "", "" // do not carry pick-list values into text fields
+					}
+					s.Op = newOp
+				})
+				if !changed {
+					return
+				}
+				renderSteps() // refresh placeholders, pick-lists and hint
+				applyAllUI()
+			})
+			opSel.Selected = string(step.Op) // direct set: avoid re-triggering OnChanged
+
+			aPlace, bPlace, bUsed := stepPlaceholders(step.Op)
+
+			var aObj fyne.CanvasObject
+			if opts := rename.Options(step.Op); opts != nil {
+				aSel := widget.NewSelect(opts, func(v string) {
+					updateStep(sid, func(s *rename.Step) { s.A = v })
+					applyAllUI()
+				})
+				aSel.Selected = step.A
+				aObj = aSel
+			} else {
+				aEntry := widget.NewEntry()
+				aEntry.SetText(step.A)
+				aEntry.SetPlaceHolder(aPlace)
+				aEntry.OnChanged = func(v string) {
+					updateStep(sid, func(s *rename.Step) { s.A = v })
+					showErr()
+					applyAllUI()
+				}
+				aObj = aEntry
+			}
+
+			bEntry := widget.NewEntry()
+			bEntry.SetText(step.B)
+			bEntry.SetPlaceHolder(bPlace)
+			bEntry.OnChanged = func(v string) {
+				updateStep(sid, func(s *rename.Step) { s.B = v })
+				showErr()
+				applyAllUI()
+			}
+			if !bUsed {
+				bEntry.Disable()
+			}
+
+			hint := widget.NewLabelWithStyle(opHelp[step.Op], fyne.TextAlignLeading, fyne.TextStyle{Italic: true})
+			hint.Wrapping = fyne.TextWrapWord
+
+			isCollapsed := collapsed[sid]
+			chevron := theme.MenuDropDownIcon()
+			if isCollapsed {
+				chevron = theme.MenuExpandIcon()
+			}
+			toggle := widget.NewButtonWithIcon("", chevron, func() {
+				collapsed[sid] = !collapsed[sid]
+				renderSteps()
+			})
+			toggle.Importance = widget.LowImportance
+			headerObjs := []fyne.CanvasObject{}
+			if isCollapsed { // one-line summary between the toggle and the buttons
+				summary := widget.NewLabel(describeStep(step))
+				summary.Truncation = fyne.TextTruncateEllipsis
+				headerObjs = append(headerObjs, summary)
+			}
+			stepsBox.Add(container.NewBorder(nil, nil,
+				container.NewHBox(toggle, enabled), container.NewHBox(upBtn, downBtn, remove), headerObjs...))
+
+			if !isCollapsed {
+				stepsBox.Add(opSel)
+				stepsBox.Add(container.NewGridWithColumns(2, aObj, bEntry))
+				if step.Op == rename.OpNumber || step.Op == rename.OpTemplate {
+					perFolder := widget.NewCheck("Restart numbering in each folder", nil)
+					perFolder.Checked = step.Flag
+					perFolder.OnChanged = func(v bool) {
+						updateStep(sid, func(s *rename.Step) { s.Flag = v })
+						applyAllUI()
+					}
+					stepsBox.Add(perFolder)
+				}
+				stepsBox.Add(hint)
+
+				// sample: what this step does to the first selected file
+				sample := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Italic: true})
+				sample.Wrapping = fyne.TextWrapWord
+
+				sampleFns = append(sampleFns, func() {
+					idx := -1
+					for i := range state.steps {
+						if state.steps[i].ID == sid {
+							idx = i
+						}
+					}
+					// show the first selected file this step actually changes
+					// (or just the first selected file if it changes none)
+					if idx < 0 {
+						sample.SetText("")
+						sample.Hide()
+						return
+					}
+					var first, before, after string
+					scanned := 0
+					for _, p := range state.filteredFiles {
+						if state.deselected[p] {
+							continue
+						}
+						b := rename.PreviewNames([]string{p}, state.steps[:idx])[0]
+						a := rename.PreviewNames([]string{p}, state.steps[:idx+1])[0]
+						if first == "" {
+							first, before, after = p, b, a
+						}
+						if b != a {
+							before, after = b, a
+							break
+						}
+						if scanned++; scanned >= 300 {
+							break
+						}
+					}
+					if idx < 0 || first == "" {
+						sample.SetText("")
+						sample.Hide()
+						return
+					}
+					sample.Show()
+					if state.steps[idx].Disabled {
+						sample.SetText("This step is switched off.")
+						return
+					}
+					if before == after {
+						sample.SetText(fmt.Sprintf("Example: %s (no change for this file)", before))
+					} else {
+						sample.SetText(fmt.Sprintf("Example: %s  ->  %s", before, after))
+					}
+				})
+				stepsBox.Add(sample)
+			}
+			stepsBox.Add(errLbl)
 			stepsBox.Add(widget.NewSeparator())
 		}
 		stepsBox.Refresh()
+		if updateSamples != nil {
+			updateSamples()
+		}
+	}
+	updateSamples = func() {
+		for _, f := range sampleFns {
+			f()
+		}
 	}
 
 	addStepBtn := widget.NewButton("+ Add rename step", func() {
 		state.nextStepID++
-		state.steps = append(state.steps, RenameStep{ID: state.nextStepID, Op: OpReplaceText, A: "", B: ""})
+		state.steps = append(state.steps, rename.Step{ID: state.nextStepID, Op: rename.OpReplaceText})
 		renderSteps()
 		applyAllUI()
 	})
@@ -595,8 +1257,88 @@ func main() {
 		applyAllUI()
 	})
 
+	/* -------------------- Presets -------------------- */
+
+	currentPreset := func() preset.Preset {
+		return preset.Preset{
+			Steps:         append([]rename.Step(nil), state.steps...),
+			Filters:       append([]filter.Rule(nil), state.filters...),
+			MatchAll:      state.matchAll,
+			CaseSensitive: state.caseSensitive,
+		}
+	}
+
+	loadPreset := func(p preset.Preset) {
+		state.steps, state.filters = nil, nil
+		for _, s := range p.Steps {
+			state.nextStepID++
+			s.ID = state.nextStepID
+			state.steps = append(state.steps, s)
+		}
+		for _, r := range p.Filters {
+			state.nextFilterID++
+			r.ID = state.nextFilterID
+			state.filters = append(state.filters, r)
+		}
+		state.matchAll, state.caseSensitive = p.MatchAll, p.CaseSensitive
+		// direct field sets: do not fire OnChanged
+		matchModeSelect.Selected = matchAnyLabel
+		if p.MatchAll {
+			matchModeSelect.Selected = matchAllLabel
+		}
+		matchModeSelect.Refresh()
+		caseSensitiveCheck.Checked = p.CaseSensitive
+		caseSensitiveCheck.Refresh()
+		renderFilters()
+		renderSteps()
+		applyAllUI()
+	}
+
+	presetsBtn := widget.NewButtonWithIcon("Presets…", theme.DocumentIcon(), func() {
+		showPresets(w, presetHooks{current: currentPreset, apply: loadPreset})
+	})
+
+	sidecarCheck := widget.NewCheck("Also rename related files (.xmp sidecars, RAW+JPEG pairs)", func(v bool) {
+		state.sidecars = v
+		a.Preferences().SetBool(sidecarsKey, v)
+		applyAllUI()
+	})
+	sidecarCheck.Checked = state.sidecars
+	sidecarExtLbl := widget.NewLabel("")
+	updateSidecarLbl := func() { sidecarExtLbl.SetText(fmt.Sprintf("%d file types", len(state.sidecarSet))) }
+	updateSidecarLbl()
+	sidecarExtBtn := widget.NewButton("Edit file types…", func() {
+		entry := widget.NewMultiLineEntry()
+		entry.Wrapping = fyne.TextWrapWord
+		entry.SetMinRowsVisible(4)
+		entry.SetText(orDefault(state.sidecarExts, rename.DefaultSidecarExts))
+		intro := widget.NewLabel("File types that are renamed together with the main file (separate with commas or spaces):")
+		intro.Wrapping = fyne.TextWrapWord
+		reset := widget.NewButton("Reset to default", func() { entry.SetText(rename.DefaultSidecarExts) })
+		d := dialog.NewCustomConfirm("Related file types", "Save", "Cancel",
+			container.NewVBox(intro, entry, reset),
+			func(ok bool) {
+				if !ok {
+					return
+				}
+				v := strings.TrimSpace(entry.Text)
+				state.sidecarExts = v
+				state.sidecarSet = rename.ParseExts(orDefault(v, rename.DefaultSidecarExts))
+				a.Preferences().SetString(sidecarExtsKey, v)
+				updateSidecarLbl()
+				applyAllUI()
+			}, w)
+		d.Resize(fyne.NewSize(520, 340))
+		d.Show()
+	})
+	sidecarHint := widget.NewLabelWithStyle(sidecarHelp, fyne.TextAlignLeading, fyne.TextStyle{Italic: true})
+	sidecarHint.Wrapping = fyne.TextWrapWord
+
+	needHelp := widget.NewLabel("Click Help (or press F1) for a guide to filters, rename steps, presets, conflicts and undo.")
+	needHelp.Wrapping = fyne.TextWrapWord
+
 	left := container.NewVScroll(container.NewVBox(
-		widget.NewLabelWithStyle("Filters", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabelWithStyle("1. Filters (optional)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		matchModeSelect,
 		caseSensitiveCheck,
 		container.NewHBox(addFilterBtn, clearFiltersBtn),
@@ -604,17 +1346,20 @@ func main() {
 		filtersBox,
 
 		widget.NewSeparator(),
-		widget.NewLabelWithStyle("Rename preview pipeline", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		container.NewHBox(addStepBtn, clearStepsBtn),
+		widget.NewLabelWithStyle("2. Rename steps (applied top to bottom)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.NewHBox(addStepBtn, clearStepsBtn, presetsBtn),
 		widget.NewSeparator(),
 		stepsBox,
 
 		widget.NewSeparator(),
-		widget.NewLabelWithStyle("Tip", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		widget.NewLabel(`Example:
-- Remove text: "vivek"
-- Insert before extension: "(awesome)"
-- Change extension: "xyz"`),
+		widget.NewLabelWithStyle("3. Options", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		sidecarCheck,
+		container.NewHBox(sidecarExtBtn, sidecarExtLbl),
+		sidecarHint,
+
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("Need help?", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		needHelp,
 	))
 
 	renderFilters()
@@ -631,47 +1376,27 @@ func main() {
 		if state.folderPath == "" {
 			return
 		}
-		files, err := listAllFiles(state.folderPath, state.recursive)
-		if err != nil {
-			dialog.ShowError(err, w)
-			return
-		}
-		state.allFiles = files
-		state.deselected = map[string]bool{}
-		applyAll(state)
-		updatePageView()
+		reloadFiles(false, nil)
 	})
 
 	loadFolder := func(path string) {
 		state.folderPath = path
-		selectedFolderLabel.SetText("Folder: " + path)
-
-		files, err := listAllFiles(path, state.recursive)
-		if err != nil {
-			dialog.ShowError(err, w)
-			state.allFiles = nil
-			applyAll(state)
-			updatePageView()
-			return
-		}
-
-		state.allFiles = files
-		state.deselected = map[string]bool{}
-		applyAll(state)
-		updatePageView()
-		saveRecentFolder(path)
+		selectedFolderLabel.SetText("Folder: " + displayPath(path))
+		reloadFiles(false, func(ok bool) {
+			if ok {
+				saveRecentFolder(path)
+			}
+		})
 	}
 
 	// Recent folders dropdown — populated from persisted preferences
-	initialRecents := getRecentFolders()
-	recentOpts := append([]string{"Open recent…"}, initialRecents...)
-	recentSelect = widget.NewSelect(recentOpts, func(sel string) {
-		if sel == "Open recent…" {
+	recentSelect = widget.NewSelect(append([]string{recentPlaceholder}, getRecentFolders()...), func(sel string) {
+		if sel == recentPlaceholder {
 			return
 		}
 		loadFolder(sel)
 	})
-	recentSelect.SetSelected("Open recent…")
+	recentSelect.SetSelected(recentPlaceholder)
 
 	refreshBtn := widget.NewButton("Refresh", func() {
 		if state.folderPath == "" {
@@ -689,493 +1414,321 @@ func main() {
 		}, w).Show()
 	})
 
-	aboutBtn := widget.NewButton("About", func() {
-		dialog.ShowInformation(
-			"About File Rename Utility",
-			"File Rename Utility helps you filter and preview files in a folder, then bulk-rename them safely.\n\n"+
-				"License: CC BY-NC 4.0 | Commercial \n\n"+
-				"Download the latest version here:\n"+
-				"https://github.com/blackarck/renforge",
-			w,
-		)
+	// Text size: A− / A+ (remembered). Row heights are recomputed for the new font.
+	var smallerBtn, largerBtn *widget.Button
+	syncScaleButtons := func() {
+		if textScaleIdx == 0 {
+			smallerBtn.Disable()
+		} else {
+			smallerBtn.Enable()
+		}
+		if textScaleIdx == len(textScales)-1 {
+			largerBtn.Disable()
+		} else {
+			largerBtn.Enable()
+		}
+	}
+	applyTextScale := func(idx int) {
+		textScaleIdx = idx
+		a.Preferences().SetInt(textScaleKey, idx)
+		a.Settings().SetTheme(newScaledTheme(textScales[idx], themeMode))
+		syncScaleButtons()
+		refreshView()
+	}
+	smallerBtn = widget.NewButton("A−", func() { applyTextScale(textScaleIdx - 1) })
+	largerBtn = widget.NewButton("A+", func() { applyTextScale(textScaleIdx + 1) })
+	syncScaleButtons()
+
+	// Colour mode: Auto (follow the system) → Light → Dark (remembered).
+	var themeBtn *widget.Button
+	themeBtn = widget.NewButtonWithIcon(modeNames[themeMode], theme.ColorPaletteIcon(), func() {
+		themeMode = (themeMode + 1) % len(modeNames)
+		a.Preferences().SetInt(themeModeKey, themeMode)
+		themeBtn.SetText(modeNames[themeMode])
+		a.Settings().SetTheme(newScaledTheme(textScales[textScaleIdx], themeMode))
+		refreshView()
 	})
 
+	helpBtn := widget.NewButtonWithIcon("Help", theme.HelpIcon(), func() { showHelp(w, 0) })
+
+	aboutBtn := widget.NewButton("About", func() { showAbout(w) })
+
+	brand := container.NewHBox(
+		brandImage(28),
+		widget.NewLabelWithStyle("RenForge", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+	)
+
 	topBar := container.NewBorder(nil, nil,
-		container.NewHBox(selectFolderBtn, recentSelect, refreshBtn, recursiveCheck),
-		container.NewHBox(aboutBtn),
+		container.NewHBox(brand, widget.NewSeparator(), selectFolderBtn, recentSelect, refreshBtn, recursiveCheck),
+		container.NewHBox(smallerBtn, largerBtn, themeBtn, helpBtn, aboutBtn),
 		selectedFolderLabel,
 	)
 
 	/* -------------------- Layout -------------------- */
 
 	split := container.NewHSplit(left, right)
-	split.Offset = 0.38
+	split.Offset = 0.40
+	if off := a.Preferences().FloatWithFallback(splitKey, 0.40); off > 0.15 && off < 0.85 {
+		split.Offset = off
+	}
 
 	root := container.NewBorder(topBar, nil, nil, nil, split)
-	w.SetContent(root)
 
-	updatePageView()
+	// Remember window size and the split position between sessions.
+	var lastSize fyne.Size
+	var geomTimer *time.Timer
+	saveGeometry := func() {
+		if lastSize.Width > 0 {
+			a.Preferences().SetFloat(winWKey, float64(lastSize.Width))
+			a.Preferences().SetFloat(winHKey, float64(lastSize.Height))
+		}
+		a.Preferences().SetFloat(splitKey, split.Offset)
+	}
+	w.SetContent(container.New(&resizeWatcher{onSize: func(sz fyne.Size) {
+		lastSize = sz
+		if geomTimer != nil {
+			geomTimer.Stop()
+		}
+		off := split.Offset
+		geomTimer = time.AfterFunc(700*time.Millisecond, func() {
+			a.Preferences().SetFloat(winWKey, float64(sz.Width))
+			a.Preferences().SetFloat(winHKey, float64(sz.Height))
+			a.Preferences().SetFloat(splitKey, off)
+		})
+	}}, root))
+	a.Lifecycle().SetOnStopped(saveGeometry)
 
-	w.ShowAndRun()
+	w.Canvas().SetOnTypedKey(func(ev *fyne.KeyEvent) {
+		switch ev.Name {
+		case fyne.KeyF1:
+			showHelp(w, 0)
+		case fyne.KeyEscape:
+			closeInfoDialog() // Help / About
+		}
+	})
+
+	// Drop a folder (or a file: its folder) on the window to open it.
+	w.SetOnDropped(func(_ fyne.Position, uris []fyne.URI) {
+		for _, u := range uris {
+			p := u.Path()
+			fi, err := os.Stat(p)
+			if err != nil {
+				continue
+			}
+			if !fi.IsDir() {
+				p = filepath.Dir(p)
+			}
+			loadFolder(p)
+			return
+		}
+	})
+
+	// Show the guide automatically the first time the app is opened.
+	a.Lifecycle().SetOnStarted(func() {
+		if !a.Preferences().Bool(seenHelpKey) {
+			a.Preferences().SetBool(seenHelpKey, true)
+			showHelp(w, 0)
+		}
+	})
+
+	refreshView()
+
+	return &appUI{
+		state:       state,
+		loadFolder:  loadFolder,
+		loadPreset:  loadPreset,
+		refreshView: refreshView,
+		applyBtn:    applyBtn,
+		collapse: func(i int) {
+			if i >= 0 && i < len(state.steps) {
+				collapsed[state.steps[i].ID] = true
+				renderSteps()
+			}
+		},
+	}
 }
 
 /* -------------------- Apply Pipeline Helpers -------------------- */
 
 func applyAll(state *AppState) {
-	applyFilters(state)
-	recomputePreviewCounts(state)
-	state.page = 0
+	state.filteredFiles = nil
+	if len(state.allFiles) > 0 {
+		state.filteredFiles = filter.Files(state.allFiles, state.filters, state.matchAll, state.caseSensitive)
+	}
+	state.indexPaths()
+	state.sidecarIx = nil
+	if state.sidecars {
+		state.sidecarIx = rename.NewSidecarIndex(state.allFiles)
+	}
+	sortFiles(state)
+	recomputePreview(state)
 }
 
-func applyFilters(state *AppState) {
-	if len(state.allFiles) == 0 {
-		state.filteredFiles = nil
+// sortFiles orders the file list. Date and size use cached metadata (files not
+// loaded yet count as equal and keep natural name order until they are).
+func sortFiles(state *AppState) {
+	files := state.filteredFiles
+	need := sortNeed(state.sortMode)
+	byName := func(i, j int) bool { return rename.NaturalLess(files[i], files[j]) }
+
+	key := func(p string) (t time.Time, size int64) {
+		if info, ok := meta.Cached(p, need); ok {
+			return info.Date(), info.Size
+		}
 		return
 	}
-	state.filteredFiles = filterFilesMulti(state.allFiles, state.filters, state.matchAll, state.caseSensitive)
-}
-
-func recomputePreviewCounts(state *AppState) {
-	counts := make(map[string]int, len(state.filteredFiles))
-	for _, p := range state.filteredFiles {
-		if state.deselected[p] {
-			continue
-		}
-		orig := filepath.Base(p)
-		prev := applyRenameSteps(orig, state.steps)
-		// key by (dir, previewName) so files in different subdirs don't false-conflict
-		counts[filepath.Dir(p)+"\x00"+prev]++
-	}
-	state.previewCounts = counts
-}
-
-/* -------------------- Plan / Confirm / Apply -------------------- */
-
-type PlanSummary struct {
-	Total        int
-	OkCount      int
-	Unchanged    int
-	Invalid      []string
-	Duplicate    []string
-	TargetExists []string
-}
-
-func buildPlan(state *AppState) ([]RenamePlanItem, PlanSummary) {
-	// operate only on selected (non-deselected) files
-	var selected []string
-	for _, p := range state.filteredFiles {
-		if !state.deselected[p] {
-			selected = append(selected, p)
-		}
-	}
-
-	items := make([]RenamePlanItem, 0, len(selected))
-
-	// key: "dir\x00newName" -> count, to detect within-dir conflicts
-	dupCount := map[string]int{}
-	previewByPath := map[string]string{}
-
-	for _, p := range selected {
-		newName := applyRenameSteps(filepath.Base(p), state.steps)
-		previewByPath[p] = newName
-		dupCount[filepath.Dir(p)+"\x00"+newName]++
-	}
-
-	var sum PlanSummary
-	sum.Total = len(selected)
-
-	for _, oldPath := range selected {
-		oldName := filepath.Base(oldPath)
-		newName := previewByPath[oldPath]
-		newPath := filepath.Join(filepath.Dir(oldPath), newName)
-
-		it := RenamePlanItem{
-			OldPath: oldPath,
-			NewPath: newPath,
-			OldName: oldName,
-			NewName: newName,
-			Status:  "ok",
-		}
-
-		if newName == oldName {
-			sum.Unchanged++
-			it.Status = "skip"
-			it.Reason = "unchanged"
-			items = append(items, it)
-			continue
-		}
-
-		if reason := invalidNameReason(newName); reason != "" {
-			sum.Invalid = append(sum.Invalid, fmt.Sprintf("%s → %s (%s)", oldName, newName, reason))
-			it.Status = "skip"
-			it.Reason = "invalid: " + reason
-			items = append(items, it)
-			continue
-		}
-
-		if dupCount[filepath.Dir(oldPath)+"\x00"+newName] > 1 {
-			sum.Duplicate = append(sum.Duplicate, fmt.Sprintf("%s → %s", oldName, newName))
-			it.Status = "skip"
-			it.Reason = "conflict: duplicate preview name"
-			items = append(items, it)
-			continue
-		}
-
-		if _, err := os.Stat(newPath); err == nil {
-			sum.TargetExists = append(sum.TargetExists, fmt.Sprintf("%s → %s", oldName, newName))
-			it.Status = "skip"
-			it.Reason = "conflict: target exists on disk"
-			items = append(items, it)
-			continue
-		}
-
-		sum.OkCount++
-		items = append(items, it)
-	}
-
-	return items, sum
-}
-
-func buildConfirmMessage(sum PlanSummary) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("You are about to process %d file(s).\n", sum.Total))
-	b.WriteString(fmt.Sprintf("Will rename: %d\n", sum.OkCount))
-	b.WriteString(fmt.Sprintf("Unchanged (skipped): %d\n\n", sum.Unchanged))
-
-	if len(sum.Invalid) > 0 {
-		b.WriteString("Invalid names (skipped):\n")
-		for _, s := range firstN(sum.Invalid, 20) {
-			b.WriteString(" - " + s + "\n")
-		}
-		if len(sum.Invalid) > 20 {
-			b.WriteString(fmt.Sprintf(" ... and %d more\n", len(sum.Invalid)-20))
-		}
-		b.WriteString("\n")
-	}
-
-	if len(sum.Duplicate) > 0 {
-		b.WriteString("Duplicate preview conflicts (skipped):\n")
-		for _, s := range firstN(sum.Duplicate, 20) {
-			b.WriteString(" - " + s + "\n")
-		}
-		if len(sum.Duplicate) > 20 {
-			b.WriteString(fmt.Sprintf(" ... and %d more\n", len(sum.Duplicate)-20))
-		}
-		b.WriteString("\n")
-	}
-
-	if len(sum.TargetExists) > 0 {
-		b.WriteString("Target already exists on disk (skipped):\n")
-		for _, s := range firstN(sum.TargetExists, 20) {
-			b.WriteString(" - " + s + "\n")
-		}
-		if len(sum.TargetExists) > 20 {
-			b.WriteString(fmt.Sprintf(" ... and %d more\n", len(sum.TargetExists)-20))
-		}
-		b.WriteString("\n")
-	}
-
-	b.WriteString("Proceed?")
-	return b.String()
-}
-
-// applyRenames uses a two-phase rename to safely handle circular renames
-// (e.g. a→b and b→a). Phase 1 moves every file to a temp name; phase 2
-// moves each temp name to its final destination.
-func applyRenames(plan []RenamePlanItem) []RenamePlanItem {
-	out := make([]RenamePlanItem, len(plan))
-	copy(out, plan)
-
-	type staged struct {
-		idx     int
-		tmpPath string
-	}
-	var phase2 []staged
-
-	ts := time.Now().UnixNano()
-
-	for i := range out {
-		if out[i].Status != "ok" {
-			continue
-		}
-		tmpPath := filepath.Join(filepath.Dir(out[i].OldPath), fmt.Sprintf(".renforge_tmp_%d_%d", ts, i))
-		if err := os.Rename(out[i].OldPath, tmpPath); err != nil {
-			out[i].Status = "error"
-			out[i].Reason = err.Error()
-			continue
-		}
-		phase2 = append(phase2, staged{i, tmpPath})
-	}
-
-	for _, s := range phase2 {
-		if err := os.Rename(s.tmpPath, out[s.idx].NewPath); err != nil {
-			out[s.idx].Status = "error"
-			out[s.idx].Reason = err.Error()
-			// best-effort restore to original name
-			_ = os.Rename(s.tmpPath, out[s.idx].OldPath)
-		} else {
-			out[s.idx].Status = "renamed"
-		}
-	}
-
-	return out
-}
-
-func buildResultMessage(items []RenamePlanItem, dryRun bool) string {
-	var renamed, skipped, errors int
-	for _, it := range items {
-		switch it.Status {
-		case "renamed":
-			renamed++
-		case "skip":
-			skipped++
-		case "error":
-			errors++
-		case "dry-run":
-			renamed++
-		}
-	}
-
-	if dryRun {
-		return fmt.Sprintf("Dry run complete.\nWould rename: %d\nSkipped: %d\nErrors: %d", renamed, skipped, errors)
-	}
-	return fmt.Sprintf("Apply complete.\nRenamed: %d\nSkipped: %d\nErrors: %d", renamed, skipped, errors)
-}
-
-/* -------------------- Undo CSV -------------------- */
-
-func writeUndoCSV(wc fyne.URIWriteCloser, plan []RenamePlanItem) error {
-	cw := csv.NewWriter(wc)
-	defer cw.Flush()
-	_ = cw.Write([]string{"old_path", "new_path", "old_name", "new_name", "status", "reason"})
-	for _, it := range plan {
-		_ = cw.Write([]string{it.OldPath, it.NewPath, it.OldName, it.NewName, it.Status, it.Reason})
-	}
-	return cw.Error()
-}
-
-func overwriteUndoCSV(path string, plan []RenamePlanItem) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	cw := csv.NewWriter(f)
-	defer cw.Flush()
-	_ = cw.Write([]string{"old_path", "new_path", "old_name", "new_name", "status", "reason"})
-	for _, it := range plan {
-		_ = cw.Write([]string{it.OldPath, it.NewPath, it.OldName, it.NewName, it.Status, it.Reason})
-	}
-	return cw.Error()
-}
-
-/* -------------------- File listing -------------------- */
-
-func listAllFiles(folder string, recursive bool) ([]string, error) {
-	var files []string
-
-	if recursive {
-		err := filepath.WalkDir(folder, func(path string, d os.DirEntry, err error) error {
-			if err != nil {
-				return err
+	switch state.sortMode {
+	case sortNameDesc:
+		sort.SliceStable(files, func(i, j int) bool { return byName(j, i) })
+	case sortDateAsc, sortDateDesc:
+		desc := state.sortMode == sortDateDesc
+		sort.SliceStable(files, func(i, j int) bool {
+			ti, _ := key(files[i])
+			tj, _ := key(files[j])
+			if ti.Equal(tj) {
+				return byName(i, j)
 			}
-			if d.IsDir() {
-				return nil
-			}
-			name := strings.TrimSpace(d.Name())
-			if name == "" {
-				return nil
-			}
-			files = append(files, path)
-			return nil
+			return ti.Before(tj) != desc
 		})
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		entries, err := os.ReadDir(folder)
-		if err != nil {
-			return nil, err
-		}
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
+	case sortSizeAsc, sortSizeDesc:
+		desc := state.sortMode == sortSizeDesc
+		sort.SliceStable(files, func(i, j int) bool {
+			_, si := key(files[i])
+			_, sj := key(files[j])
+			if si == sj {
+				return byName(i, j)
 			}
-			name := strings.TrimSpace(e.Name())
-			if name == "" {
-				continue
-			}
-			files = append(files, filepath.Join(folder, name))
-		}
+			return (si < sj) != desc
+		})
+	default:
+		// natural name order is the order ListFiles already produced
+		sort.SliceStable(files, byName)
 	}
-
-	sort.Strings(files)
-	return files, nil
 }
 
-/* -------------------- Filter engine -------------------- */
-
-func filterFilesMulti(all []string, rules []FilterRule, matchAll bool, caseSensitive bool) []string {
-	out := make([]string, 0, len(all))
-	for _, full := range all {
-		base := filepath.Base(full)
-		if matchesRules(base, rules, matchAll, caseSensitive) {
-			out = append(out, full)
+// relatedCount is the number of related files that would be renamed along
+// with the primary file (those that are not selected files themselves).
+func relatedCount(state *AppState, primary string) int {
+	n := 0
+	for _, r := range state.sidecarIx.For(primary, state.sidecarSet) {
+		if _, isPrimary := state.previewNames[r.Path]; !isPrimary {
+			n++
 		}
 	}
-	sort.Strings(out)
-	return out
+	return n
 }
 
-func matchesRules(filename string, rules []FilterRule, matchAll bool, caseSensitive bool) bool {
-	if len(rules) == 0 {
-		return true
+// displayPath shows the home folder as "~" to keep the folder label short.
+func displayPath(p string) string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" && strings.HasPrefix(p, home+string(filepath.Separator)) {
+		return "~" + p[len(home):]
 	}
+	return p
+}
 
-	name := filename
-	if !caseSensitive {
-		name = strings.ToLower(name)
+func orDefault(s, def string) string {
+	if strings.TrimSpace(s) == "" {
+		return def
 	}
+	return s
+}
 
-	ruleMatch := func(r FilterRule) bool {
-		val := strings.TrimSpace(r.Value)
-		if val == "" {
-			return true
-		}
-		check := name
-		v := val
-		if !caseSensitive {
-			v = strings.ToLower(val)
-		}
-
-		switch r.Mode {
-		case "contains":
-			return strings.Contains(check, v)
-		case "starts with":
-			return strings.HasPrefix(check, v)
-		case "ends with":
-			return strings.HasSuffix(check, v)
-		case "extension":
-			ext := filepath.Ext(filename)
-			vx := v
-			if !strings.HasPrefix(vx, ".") {
-				vx = "." + vx
-			}
-			if !caseSensitive {
-				ext = strings.ToLower(ext)
-				vx = strings.ToLower(vx)
-			}
-			return ext == vx
-		default:
-			return strings.Contains(check, v)
-		}
+// recomputePreview recalculates the new name of every selected file. A file's
+// position among the selected files is its number for "Number files".
+func recomputePreview(state *AppState) {
+	sel := state.selected()
+	names := rename.PreviewNames(sel, state.steps)
+	state.previewNames = make(map[string]string, len(sel))
+	state.previewCounts = make(map[string]int, len(sel))
+	for i, p := range sel {
+		state.previewNames[p] = names[i]
+		// keyed by (dir, name) so files in different subdirs don't false-conflict
+		state.previewCounts[rename.DupKey(filepath.Dir(p), names[i])]++
 	}
+}
 
-	if matchAll {
-		for _, r := range rules {
-			if !ruleMatch(r) {
-				return false
-			}
-		}
-		return true
-	}
-
-	for _, r := range rules {
-		if ruleMatch(r) {
+func contains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
 			return true
 		}
 	}
 	return false
 }
 
-/* -------------------- Rename pipeline -------------------- */
+/* -------------------- Messages -------------------- */
 
-func applyRenameSteps(original string, steps []RenameStep) string {
-	if len(steps) == 0 {
-		return original
+func appendList(b *strings.Builder, title string, lines []string) {
+	if len(lines) == 0 {
+		return
 	}
-	name := original
-
-	for _, s := range steps {
-		switch s.Op {
-		case OpRemoveText:
-			if s.A != "" {
-				name = strings.ReplaceAll(name, s.A, "")
-			}
-		case OpReplaceText:
-			if s.A != "" {
-				name = strings.ReplaceAll(name, s.A, s.B)
-			}
-		case OpInsertBeforeExt, OpAppend:
-			base := strings.TrimSuffix(name, filepath.Ext(name))
-			ext := filepath.Ext(name)
-			name = base + s.A + ext
-		case OpPrepend:
-			base := strings.TrimSuffix(name, filepath.Ext(name))
-			ext := filepath.Ext(name)
-			name = s.A + base + ext
-		case OpChangeExt:
-			base := strings.TrimSuffix(name, filepath.Ext(name))
-			newExt := strings.TrimSpace(s.A)
-			if newExt == "" {
-				name = base
-			} else {
-				if !strings.HasPrefix(newExt, ".") {
-					newExt = "." + newExt
-				}
-				name = base + newExt
-			}
-		}
+	b.WriteString(title + "\n")
+	for _, s := range firstN(lines, 20) {
+		b.WriteString(" - " + s + "\n")
 	}
-
-	return strings.TrimSpace(name)
+	if len(lines) > 20 {
+		b.WriteString(fmt.Sprintf(" ... and %d more\n", len(lines)-20))
+	}
+	b.WriteString("\n")
 }
 
-/* -------------------- Validations -------------------- */
+func buildConfirmMessage(sum rename.Summary, dryRun bool) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Files selected: %d\n", sum.Total))
+	b.WriteString(fmt.Sprintf("Will rename: %d\n", sum.OkCount))
+	b.WriteString(fmt.Sprintf("Unchanged (skipped): %d\n", sum.Unchanged))
 
-func invalidNameReason(name string) string {
-	trim := strings.TrimSpace(name)
-	if trim == "" {
-		return "empty name"
+	if sum.Sidecars > 0 {
+		b.WriteString(fmt.Sprintf("  of which related files (sidecars, pairs): %d\n", sum.Sidecars))
 	}
-	if strings.ContainsAny(trim, `<>:"/\|?*`) {
-		return "invalid characters"
+	b.WriteString("\n")
+	appendList(&b, "Invalid names (skipped):", sum.Invalid)
+	appendList(&b, "Duplicate preview conflicts (skipped):", sum.Duplicate)
+	appendList(&b, "Target already exists on disk (skipped):", sum.TargetExists)
+	appendList(&b, "Skipped because a related file cannot be renamed:", sum.GroupSkipped)
+
+	switch {
+	case sum.OkCount == 0:
+		b.WriteString("Nothing can be renamed with the current steps.")
+	case dryRun:
+		b.WriteString("Dry run is ON: no files will be changed.\nProceed?")
+	default:
+		b.WriteString("Dry run is OFF: files WILL be renamed.\nProceed?")
 	}
-	reserved := map[string]bool{
-		"CON": true, "PRN": true, "AUX": true, "NUL": true,
-		"COM1": true, "COM2": true, "COM3": true, "COM4": true, "COM5": true,
-		"COM6": true, "COM7": true, "COM8": true, "COM9": true,
-		"LPT1": true, "LPT2": true, "LPT3": true, "LPT4": true, "LPT5": true,
-		"LPT6": true, "LPT7": true, "LPT8": true, "LPT9": true,
-	}
-	base := strings.TrimSuffix(trim, filepath.Ext(trim))
-	if reserved[strings.ToUpper(base)] {
-		return "reserved filename"
-	}
-	return ""
+	return b.String()
 }
 
-/* -------------------- Paging helpers -------------------- */
-
-func pageCount(total, pageSize int) int {
-	if pageSize <= 0 {
-		return 1
+func buildResultMessage(items []rename.Item, dryRun bool) string {
+	renamed, skipped, errs := rename.Counts(items)
+	if dryRun {
+		return fmt.Sprintf("Would rename: %d\nSkipped: %d\nErrors: %d", renamed, skipped, errs)
 	}
-	if total == 0 {
-		return 1
-	}
-	return (total + pageSize - 1) / pageSize
+	return fmt.Sprintf("Renamed: %d\nSkipped: %d\nErrors: %d", renamed, skipped, errs)
 }
 
-func clamp(v, lo, hi int) int {
-	if v < lo {
-		return lo
+// strandedMessage warns about files left under a temporary name, if any.
+func strandedMessage(items []rename.Item) string {
+	st := rename.Stranded(items)
+	if len(st) == 0 {
+		return ""
 	}
-	if v > hi {
-		return hi
+	msg := "\n\n⚠ Some files could not be restored and are still under a temporary name:\n"
+	for _, it := range firstN(st, 10) {
+		msg += " - " + it.TempPath + "\n"
 	}
-	return v
+	return msg
+}
+
+func buildUndoMessage(sum undo.RevertSummary, path string) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Log: %s\n\n", path))
+	b.WriteString(fmt.Sprintf("Renames in log: %d\nCan be restored: %d\n\n", sum.Total, sum.Ready))
+	appendList(&b, "Not found (moved or deleted since):", sum.Missing)
+	appendList(&b, "Original name is in use again (skipped):", sum.Blocked)
+	if sum.Ready > 0 {
+		b.WriteString("Restore the original names?")
+	}
+	return b.String()
 }
 
 /* -------------------- small helpers -------------------- */

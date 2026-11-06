@@ -43,7 +43,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23.x"
+          go-version-file: go.mod
           cache: false
 
       - name: Install fyne tool (new)
@@ -67,24 +67,30 @@ jobs:
             libxxf86vm-dev \
             libasound2-dev
 
+      - name: Test engine packages
+        shell: bash
+        run: |
+          go vet ./internal/...
+          go test ./internal/...
+
       # --- macOS: create icon.icns from icon.png (no ImageMagick needed) ---
-      - name: Create icon.icns from icon.png (macOS)
+      - name: Create icon.icns from icon-macos.png (macOS)
         if: matrix.goos == 'darwin'
         shell: bash
         run: |
-          test -f icon.png
+          test -f icon-macos.png
 
           mkdir -p icon.iconset
-          sips -z 16 16     icon.png --out icon.iconset/icon_16x16.png
-          sips -z 32 32     icon.png --out icon.iconset/icon_16x16@2x.png
-          sips -z 32 32     icon.png --out icon.iconset/icon_32x32.png
-          sips -z 64 64     icon.png --out icon.iconset/icon_32x32@2x.png
-          sips -z 128 128   icon.png --out icon.iconset/icon_128x128.png
-          sips -z 256 256   icon.png --out icon.iconset/icon_128x128@2x.png
-          sips -z 256 256   icon.png --out icon.iconset/icon_256x256.png
-          sips -z 512 512   icon.png --out icon.iconset/icon_256x256@2x.png
-          sips -z 512 512   icon.png --out icon.iconset/icon_512x512.png
-          sips -z 1024 1024 icon.png --out icon.iconset/icon_512x512@2x.png
+          sips -z 16 16     icon-macos.png --out icon.iconset/icon_16x16.png
+          sips -z 32 32     icon-macos.png --out icon.iconset/icon_16x16@2x.png
+          sips -z 32 32     icon-macos.png --out icon.iconset/icon_32x32.png
+          sips -z 64 64     icon-macos.png --out icon.iconset/icon_32x32@2x.png
+          sips -z 128 128   icon-macos.png --out icon.iconset/icon_128x128.png
+          sips -z 256 256   icon-macos.png --out icon.iconset/icon_128x128@2x.png
+          sips -z 256 256   icon-macos.png --out icon.iconset/icon_256x256.png
+          sips -z 512 512   icon-macos.png --out icon.iconset/icon_256x256@2x.png
+          sips -z 512 512   icon-macos.png --out icon.iconset/icon_512x512.png
+          sips -z 1024 1024 icon-macos.png --out icon.iconset/icon_512x512@2x.png
 
           iconutil -c icns icon.iconset -o icon.icns
           test -f icon.icns
@@ -95,8 +101,38 @@ jobs:
         if: matrix.goos == 'windows'
         shell: bash
         run: |
-          test -f icon.ico
-          fyne package -os windows -name renforge -icon icon.ico
+          test -f icon.png
+          # fyne converts the PNG to a multi-size .ico and embeds it, and links with -H=windowsgui (no console window)
+          fyne package -os windows -name renforge -icon icon.png
+
+      # Signs renforge.exe when a code-signing certificate is configured
+      # (see docs/RELEASING.md); otherwise the .exe stays unsigned and Windows
+      # SmartScreen will warn users.
+      - name: Sign (Windows)
+        if: matrix.goos == 'windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }} # base64 of the .pfx
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE) {
+            Write-Host "::warning::No WINDOWS_CERTIFICATE secret: renforge.exe is NOT signed (SmartScreen will warn users)."
+            exit 0
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+              Sort-Object FullName -Descending | Select-Object -First 1
+            if (-not $signtool) { throw "signtool.exe not found on this runner" }
+            & $signtool.FullName sign /f $pfx /p $env:WINDOWS_CERTIFICATE_PASSWORD /fd sha256 `
+              /tr http://timestamp.digicert.com /td sha256 /d "RenForge" renforge.exe
+            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed" }
+            & $signtool.FullName verify /pa /v renforge.exe
+            if ($LASTEXITCODE -ne 0) { throw "signature verification failed" }
+          } finally {
+            Remove-Item $pfx -Force -ErrorAction SilentlyContinue
+          }
 
       - name: Package (Linux)
         if: matrix.goos == 'linux'
@@ -110,13 +146,91 @@ jobs:
         shell: bash
         run: |
           test -f icon.icns
-          # Explicitly pass arch to ensure correct build
           fyne package -os darwin -name renforge -icon icon.icns
 
-          # Ad-hoc codesign is required for Apple Silicon
-          # Fyne usually does this, but we force it here to be safe and ensure deep signing
-          codesign --force --deep --sign - renforge.app
-          echo "Codesign complete."
+      # Signs with a Developer ID certificate and notarizes with Apple when the
+      # secrets below exist (see docs/RELEASING.md). Without them it falls back to
+      # an ad-hoc signature, which Apple Silicon needs to run at all, but users
+      # then get a Gatekeeper warning.
+      - name: Sign and notarize (macOS)
+        if: matrix.goos == 'darwin'
+        shell: bash
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }} # base64 of the Developer ID .p12
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }} # optional, e.g. "Developer ID Application: Name (TEAMID)"
+          # Notarization, option 1 (App Store Connect API key):
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }} # base64 of AuthKey_XXXX.p8
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          # Notarization, option 2 (Apple ID + app-specific password):
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${MACOS_CERTIFICATE:-}" ]; then
+            echo "::warning::No MACOS_CERTIFICATE secret: ad-hoc signing only. Users will see a Gatekeeper warning."
+            codesign --force --deep --sign - renforge.app
+            exit 0
+          fi
+
+          KEYCHAIN="$RUNNER_TEMP/renforge-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          P12="$RUNNER_TEMP/developer-id.p12"
+          API_KEY_FILE="$RUNNER_TEMP/AuthKey.p8"
+          cleanup() {
+            security delete-keychain "$KEYCHAIN" 2>/dev/null || true
+            rm -f "$P12" "$API_KEY_FILE" notarize.zip
+          }
+          trap cleanup EXIT
+
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$P12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$P12" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          # put our keychain first in the search list
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+
+          IDENTITY="${MACOS_SIGN_IDENTITY:-}"
+          if [ -z "$IDENTITY" ]; then
+            IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -n 1)"
+          fi
+          [ -n "$IDENTITY" ] || { echo "::error::No 'Developer ID Application' identity found in the certificate"; exit 1; }
+          echo "Signing with: $IDENTITY"
+
+          # Hardened runtime + secure timestamp are required for notarization.
+          codesign --force --deep --options runtime --timestamp --sign "$IDENTITY" renforge.app
+          codesign --verify --deep --strict --verbose=2 renforge.app
+
+          # Notarize
+          ditto -c -k --keepParent renforge.app notarize.zip
+          if [ -n "${APPLE_API_KEY:-}" ]; then
+            echo "$APPLE_API_KEY" | base64 --decode > "$API_KEY_FILE"
+            AUTH=(--key "$API_KEY_FILE" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER")
+          elif [ -n "${APPLE_ID:-}" ]; then
+            AUTH=(--apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID")
+          else
+            echo "::error::Signed, but no notarization credentials (APPLE_API_KEY* or APPLE_ID/APPLE_APP_PASSWORD/APPLE_TEAM_ID)"
+            exit 1
+          fi
+
+          xcrun notarytool submit notarize.zip "${AUTH[@]}" --wait --output-format json | tee notarize.json
+          if ! grep -q '"status" *: *"Accepted"' notarize.json; then
+            SUBMISSION_ID="$(jq -r '.id' notarize.json)"
+            echo "::error::Notarization was not accepted. Log:"
+            xcrun notarytool log "$SUBMISSION_ID" "${AUTH[@]}" || true
+            exit 1
+          fi
+          rm -f notarize.json
+
+          xcrun stapler staple renforge.app
+          xcrun stapler validate renforge.app
+          spctl --assess --type execute --verbose=2 renforge.app
+          echo "Signed, notarized and stapled."
 
       # --- Create single-file artifacts per OS ---
       - name: Create artifacts (Windows)

@@ -30,3 +30,12 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Local build output
+/FileRenUtil
+/renforge
+/renforge.app
+/dist/
+
+# Local notes (never commit or release)
+to-do*.md

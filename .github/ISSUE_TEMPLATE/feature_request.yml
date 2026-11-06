@@ -1,0 +1,24 @@
+name: Feature request
+description: Suggest an idea or improvement
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      placeholder: I need to number photos separately in each folder...
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like RenForge to do?
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: Example file names, before and after
+      render: text
+      placeholder: |
+        IMG_4021.CR2   ->   2024-06-01_003.CR2

@@ -1,0 +1,6 @@
+# Metadata used by `fyne package` (and `fyne build`), so you can simply run:
+#   fyne package -os darwin|windows|linux
+[Details]
+  Icon = "icon.png"
+  Name = "renforge"
+  ID = "com.blackarck.renforge"

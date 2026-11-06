@@ -1,0 +1,45 @@
+name: Bug report
+description: Something does not work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please do not include private file names or documents.
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 15 (Apple Silicon) / Windows 11 / Ubuntu 24.04
+    validations:
+      required: true
+  - type: input
+    id: build
+    attributes:
+      label: RenForge build
+      description: The downloaded file name and date, or the commit if built from source.
+      placeholder: renforge-macos-silicon.zip, downloaded 2026-11-06
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: What did you do?
+      description: Folder contents (a few example file names), the filters and the rename steps you used.
+      placeholder: |
+        Files: IMG_0042.JPG, IMG_0043.JPG
+        Filter: extension = jpg
+        Step 1: Replace text "IMG_" -> "Holiday_"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Screenshots, undo log or anything else
+      description: Drag images here. Remove private file names from any CSV first.
