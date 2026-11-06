@@ -19,11 +19,11 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
-	"FileRenUtil/internal/filter"
-	"FileRenUtil/internal/meta"
-	"FileRenUtil/internal/preset"
-	"FileRenUtil/internal/rename"
-	"FileRenUtil/internal/undo"
+	"renforge/internal/filter"
+	"renforge/internal/meta"
+	"renforge/internal/preset"
+	"renforge/internal/rename"
+	"renforge/internal/undo"
 )
 
 /* -------------------- App State -------------------- */

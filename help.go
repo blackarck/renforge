@@ -8,8 +8,8 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
-	"FileRenUtil/internal/filter"
-	"FileRenUtil/internal/rename"
+	"renforge/internal/filter"
+	"renforge/internal/rename"
 )
 
 // opHelp explains each rename step with a concrete example. It is shown under

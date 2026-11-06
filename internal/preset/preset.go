@@ -11,8 +11,8 @@ import (
 	"sort"
 	"strings"
 
-	"FileRenUtil/internal/filter"
-	"FileRenUtil/internal/rename"
+	"renforge/internal/filter"
+	"renforge/internal/rename"
 )
 
 // Preset is a saved pipeline.

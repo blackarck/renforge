@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"FileRenUtil/internal/rename"
+	"renforge/internal/rename"
 )
 
 func newTestState(files []string, steps []rename.Step) *AppState {

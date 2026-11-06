@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"FileRenUtil/internal/filter"
-	"FileRenUtil/internal/rename"
+	"renforge/internal/filter"
+	"renforge/internal/rename"
 )
 
 func TestSaveListDeleteRoundTrip(t *testing.T) {

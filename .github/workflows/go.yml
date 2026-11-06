@@ -49,7 +49,7 @@ jobs:
       - name: Install fyne tool (new)
         run: go install fyne.io/tools/cmd/fyne@latest
 
-      # ✅ Linux build deps required by glfw/go-gl (pkg-config, OpenGL, X11 headers, etc.)
+      # ✅ Linux build deps required by glfw/go-gl (pkg-config, OpenGL, X11 and Wayland headers, etc.)
       - name: Install Linux GUI deps (Fyne)
         if: matrix.goos == 'linux'
         shell: bash
@@ -65,7 +65,10 @@ jobs:
             libxinerama-dev \
             libxi-dev \
             libxxf86vm-dev \
-            libasound2-dev
+            libasound2-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            wayland-protocols
 
       - name: Test engine packages
         shell: bash
@@ -249,21 +252,17 @@ jobs:
           echo "Listing workspace after fyne package:"
           ls -la
 
-          # Prefer a directory bundle if it exists, else fall back to a binary.
-          if [ -d "renforge" ]; then
-            echo "Found directory bundle: renforge/"
-            tar -czf dist/renforge-${{ matrix.suffix }}.tar.gz renforge
-          elif [ -f "renforge" ]; then
-            echo "Found binary: renforge"
-            tar -czf dist/renforge-${{ matrix.suffix }}.tar.gz renforge
-          elif [ -f "renforge.tar.gz" ]; then
-            echo "Found prebuilt tarball: renforge.tar.gz"
-            mv renforge.tar.gz dist/renforge-${{ matrix.suffix }}.tar.gz
-          elif [ -f "renforge.tar.xz" ]; then
-            echo "Found prebuilt tarball: renforge.tar.xz"
+          # fyne package writes renforge.tar.xz (the installable archive). Prefer it
+          # over everything else: a plain "renforge" binary may also exist now that
+          # the Go module is called renforge.
+          if [ -f "renforge.tar.xz" ]; then
+            echo "Found tarball: renforge.tar.xz"
             mv renforge.tar.xz dist/renforge-${{ matrix.suffix }}.tar.xz
+          elif [ -f "renforge.tar.gz" ]; then
+            echo "Found tarball: renforge.tar.gz"
+            mv renforge.tar.gz dist/renforge-${{ matrix.suffix }}.tar.gz
           else
-            echo "ERROR: Could not find Linux output from fyne package."
+            echo "ERROR: Could not find Linux output (renforge.tar.xz) from fyne package."
             echo "Contents:"
             ls -la
             exit 1

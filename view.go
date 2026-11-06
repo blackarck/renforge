@@ -3,7 +3,7 @@ package main
 import (
 	"path/filepath"
 
-	"FileRenUtil/internal/rename"
+	"renforge/internal/rename"
 )
 
 // Which rows the preview list shows.

@@ -12,7 +12,7 @@ import (
 
 	"golang.org/x/text/unicode/norm"
 
-	"FileRenUtil/internal/meta"
+	"renforge/internal/meta"
 )
 
 // Op identifies a rename step operation.

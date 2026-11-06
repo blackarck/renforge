@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"FileRenUtil/internal/rename"
+	"renforge/internal/rename"
 )
 
 func TestRoundTripAndRevert(t *testing.T) {

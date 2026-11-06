@@ -9,8 +9,8 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
-	"FileRenUtil/internal/preset"
-	"FileRenUtil/internal/rename"
+	"renforge/internal/preset"
+	"renforge/internal/rename"
 )
 
 // presetHooks connects the presets dialog to the main window.

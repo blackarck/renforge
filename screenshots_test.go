@@ -19,9 +19,9 @@ import (
 	"fyne.io/fyne/v2/driver/software"
 	"fyne.io/fyne/v2/test"
 
-	"FileRenUtil/internal/filter"
-	"FileRenUtil/internal/preset"
-	"FileRenUtil/internal/rename"
+	"renforge/internal/filter"
+	"renforge/internal/preset"
+	"renforge/internal/rename"
 )
 
 // captureWindow is a test window whose canvas is a software-rendered canvas,
